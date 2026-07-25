@@ -14,7 +14,9 @@ import { BaseGeometry } from "../world/base_geometry";
 type Phase = "seek" | "gather" | "return";
 
 /**
- * Mine the nearest node, haul the load back to the ship, repeat.
+ * Mine the nearest node and ship the load home on companions, so the bot stays
+ * on the node instead of walking back and forth. Falls back to hauling it home
+ * itself when that is cheaper, or when every companion slot is busy.
  */
 export class GathererBehaviour implements IBehaviour {
   public readonly name = "gatherer";
@@ -43,6 +45,8 @@ export class GathererBehaviour implements IBehaviour {
   // DEBUG: ignore the seek/gather/return logic below and just send
   // DepositToBase every tick, wherever we stand. Set back to false for play.
   private static readonly FORCE_DEPOSIT = false;
+  // Set false to go back to walking every load home yourself.
+  private static readonly SHIP_BY_COMPANION = true;
 
   /** How this bot gets around. Swap for SidestepMover to change navigation. */
   private readonly mover: IMover = new PathfindingMover();
@@ -65,6 +69,17 @@ export class GathererBehaviour implements IBehaviour {
   private exploreTicksLeft = 0;
   private exploreCount = 0;
   private lastRevisitKey: string | null = null;
+  /**
+   * How many items a companion took last time, which is what one can carry.
+   * Starts at the un-researched capacity of 1 and is re-measured on every send,
+   * so Companion I/II/III are picked up the moment they finish — nothing here
+   * needs to know they exist.
+   */
+  private companionCapacity = 1;
+  /** Carried count on the tick we sent, so the next tick can measure the drop. */
+  private sentAtCarried: number | null = null;
+  private sends = 0;
+  private refusedSends = 0;
   /** Every node we have ever seen, so respawns out of vision are not lost. */
   private readonly knownNodes = new Map<
     number,
@@ -98,6 +113,17 @@ export class GathererBehaviour implements IBehaviour {
     // Let the mover see whether last tick's move actually happened.
     this.mover.observe(state, pos);
 
+    // How much a companion took tells us its capacity, so measure it first.
+    this.measureCapacity(carried);
+
+    // Shipping is tried in every phase: on the node, on the way to one, and
+    // even while walking home, since anything a companion takes is one less
+    // item to carry.
+    const shipment = this.trySendCompanion(state, pos, carried);
+    if (shipment) {
+      return shipment;
+    }
+
     // Checked in every phase, so a bot that starts (or restarts) already
     // loaded heads home instead of wandering off with a full pack.
     if (
@@ -121,6 +147,111 @@ export class GathererBehaviour implements IBehaviour {
 
 
 
+
+  /**
+   * Hand the load to a companion instead of walking it home, when there is a
+   * free slot and that is the cheaper way to move it.
+   *
+   * One SendCompanion dispatches one companion, which walks home and unloads on
+   * its own — so this is called once per companion, not once per load, and the
+   * bot keeps mining in between.
+   */
+  private trySendCompanion(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+    carried: number,
+  ): MessageProtocol.ActionBase | null {
+    if (!GathererBehaviour.SHIP_BY_COMPANION || carried <= 0 || !state.Team) {
+      return null;
+    }
+
+    if (!this.shippingBeatsWalking(state, pos)) {
+      return null;
+    }
+
+    // Hold one more item than we think fits, so every send finds out whether
+    // the capacity has been researched up. Costs nothing while we are mining
+    // anyway, and converges on the real number within a few sends. Skipped once
+    // the pack is full, or when we are already walking home with a load.
+    const probeLoad = this.companionCapacity + 1;
+    if (
+      carried < probeLoad &&
+      !this.slotsFull(state.Bot) &&
+      this.phase !== "return"
+    ) {
+      return null;
+    }
+
+    // Every slot busy. Nothing to do but keep mining, and if the pack is full
+    // the caller falls through to walking it home instead of idling here.
+    if (state.Team.CompanionNumber >= state.Team.CompanionSlots) {
+      return null;
+    }
+
+    this.sentAtCarried = carried;
+    this.sends++;
+    console.log(
+      `[${this.tag}] Companion ${this.sends} away with up to ${this.companionCapacity} of ${carried} ` +
+        `(${state.Team.CompanionNumber + 1}/${state.Team.CompanionSlots} slots in use).`,
+    );
+
+    return new MessageProtocol.SendCompanionAction();
+  }
+
+  /**
+   * Walking a full load home costs 2 x distance moves plus the deposit, all of
+   * them ticks we are not mining. Shipping the same load costs one tick per
+   * companion, so it wins everywhere except right next to the base — and wins
+   * by more with every capacity upgrade.
+   */
+  private shippingBeatsWalking(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): boolean {
+    const base = state.Base;
+    if (!base) {
+      // Nowhere known to walk to, so companions are the only way to deliver.
+      return true;
+    }
+
+    const load = Math.min(
+      GathererBehaviour.CARRY_TARGET,
+      state.Bot && state.Bot.Slots > 0 ? state.Bot.Slots : GathererBehaviour.CARRY_TARGET,
+    );
+    const sends = load / this.companionCapacity;
+    const walk = 2 * this.manhattan(pos, base.Position) + 1;
+
+    return sends < walk;
+  }
+
+  /**
+   * A companion takes as much as it can hold, so the drop in what we carry is
+   * its capacity — provided we were holding at least that much.
+   */
+  private measureCapacity(carried: number): void {
+    if (this.sentAtCarried === null) {
+      return;
+    }
+
+    const shipped = this.sentAtCarried - carried;
+    this.sentAtCarried = null;
+
+    if (shipped > this.companionCapacity) {
+      console.log(
+        `[${this.tag}] A companion carried ${shipped} items, so capacity is now ${shipped}.`,
+      );
+      this.companionCapacity = shipped;
+      this.refusedSends = 0;
+      return;
+    }
+
+    if (shipped <= 0 && ++this.refusedSends === 3) {
+      console.log(
+        `[${this.tag}] 3 companions took nothing. Check the [SERVER] Error lines: ` +
+          `the send is being refused, not the capacity being small.`,
+      );
+    }
+  }
 
   /**
    * DEBUG path for FORCE_DEPOSIT: hammer DepositToBase every tick and report
@@ -497,7 +628,8 @@ export class GathererBehaviour implements IBehaviour {
     carried: number,
   ): MessageProtocol.ActionBase | null {
     if (carried === 0) {
-      console.log(`[${this.tag}] Deposited, back to work.`);
+      // Either we unloaded at the ship or companions took the lot on the way.
+      console.log(`[${this.tag}] Pack empty, back to work.`);
       this.phase = "seek";
       this.lastCarried = 0;
       this.depositSpots = null;
