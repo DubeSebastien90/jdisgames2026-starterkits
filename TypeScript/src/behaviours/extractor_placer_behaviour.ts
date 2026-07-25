@@ -157,10 +157,6 @@ export class ExtractorPlacerBehaviour implements IBehaviour {
       if (!resource.CanHostExtractor) {
         continue;
       }
-      // Target sugar cane specifically.
-      if (!resource.Name.toLowerCase().includes("sugar")) {
-        continue;
-      }
 
       const dist = this.manhattan(pos, resource.Position);
       if (dist < bestDist) {
