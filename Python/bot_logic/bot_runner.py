@@ -20,6 +20,16 @@ class BotRunner:
 
         client = GameClient(server_url, token)
 
+        def on_update(state):
+            try:
+                return bot.get_next_action(state)
+            except Exception as ex:
+                print(f"[ERROR] Bot error: {ex}")
+                traceback.print_exc()
+                return None
+
+        client.backend_listening(on_update)
+
         try:
             print(f"[INFO] Connecting to server: {server_url}")
             connected = client.connect()
@@ -32,16 +42,6 @@ class BotRunner:
             print("[ERROR] Could not connect to the remote server.")
             print(f"-> Details: {ex}")
             return
-
-        def on_update(state):
-            try:
-                return bot.get_next_action(state)
-            except Exception as ex:
-                print(f"[ERROR] Bot error: {ex}")
-                traceback.print_exc()
-                return None
-
-        client.backend_listening(on_update)
 
         try:
             while True:
