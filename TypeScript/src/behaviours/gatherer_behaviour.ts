@@ -10,6 +10,7 @@ import {
   TeamScouting,
 } from "../team/team_scouting";
 import { BaseGeometry } from "../world/base_geometry";
+import { ResourceKind, matchesResourceKind } from "../world/resource_kinds";
 
 type Phase = "seek" | "gather" | "return";
 
@@ -19,7 +20,33 @@ type Phase = "seek" | "gather" | "return";
  * itself when that is cheaper, or when every companion slot is busy.
  */
 export class GathererBehaviour implements IBehaviour {
-  public readonly name = "gatherer";
+  public readonly name: string;
+
+  /**
+   * Which resource kinds this bot will mine, or null for "whatever is nearest".
+   *
+   * Passing kinds turns the gatherer into a specialist: one bot on sugar cane
+   * and one on chocolate beats two bots racing each other to the same node, and
+   * a recipe that wants one particular item gets it instead of whatever the map
+   * happened to put in front of the bot.
+   */
+  private readonly kinds: readonly ResourceKind[] | null;
+
+  /**
+   * @param kinds one or more resource names to stick to. Node names ("sorbet")
+   * and loot names ("ice_cream") both work — see ResourceKind. Omit for the
+   * original behaviour: mine the nearest thing.
+   */
+  public constructor(kinds?: ResourceKind | readonly ResourceKind[]) {
+    this.kinds =
+      kinds === undefined ? null : Array.isArray(kinds) ? [...kinds] : [kinds as ResourceKind];
+    this.name = this.kinds ? `gatherer:${this.kinds.join("+")}` : "gatherer";
+  }
+
+  /** Is this node one we are willing to mine? Everything, unless kinds was set. */
+  private wanted(resource: MessageProtocol.Resource): boolean {
+    return this.kinds === null || matchesResourceKind(resource, this.kinds);
+  }
 
   // Head home once we carry this many items (or the inventory slots fill up).
   private static readonly CARRY_TARGET = 10;
@@ -103,6 +130,8 @@ export class GathererBehaviour implements IBehaviour {
       amount: number;
       respawnTicks: number;
       seenTick: number;
+      /** Whether it was a kind we mine, judged when we could still see it. */
+      wanted: boolean;
     }
   >();
 
@@ -364,6 +393,7 @@ export class GathererBehaviour implements IBehaviour {
         amount: resource.CurrentAmount,
         respawnTicks: resource.RemainingTicks,
         seenTick: state.CurrentTick,
+        wanted: this.wanted(resource),
       });
 
       // Both directions on purpose: a node we can see with no machine on it is
@@ -410,6 +440,9 @@ export class GathererBehaviour implements IBehaviour {
 
     for (const [id, node] of this.knownNodes) {
       if (visible.has(id)) {
+        continue;
+      }
+      if (!node.wanted) {
         continue;
       }
 
@@ -845,6 +878,9 @@ export class GathererBehaviour implements IBehaviour {
     let bestDistance = Number.POSITIVE_INFINITY;
 
     for (const resource of resources) {
+      if (!this.wanted(resource)) {
+        continue;
+      }
       if (mustHaveStock && resource.CurrentAmount <= 0) {
         continue;
       }

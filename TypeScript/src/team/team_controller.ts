@@ -46,14 +46,20 @@ type BehaviourFactory = () => IBehaviour;
  *   BotB: () => new PumpPlacerOnResourceBehaviour("maple_syrup"),
  *   BotB: () => new PumpPlacerOnResourceBehaviour(LIQUID_RESOURCE_KINDS),
  *
+ * The gatherer takes the same names, and mines only those when you pass them:
+ *
+ *   BotA: () => new GathererBehaviour("ice_cream"),
+ *   BotB: () => new GathererBehaviour(["sugar_cane", "milk_chocolate"]),
+ *   BotB: () => new GathererBehaviour(),   // unchanged: nearest node wins
+ *
  * The names come from ResourceKind in src/world/resource_kinds.ts, so a typo is
  * a compile error. Both wait beside a node that is locked by its cooldown; pass
  * { includeLocked: false } as a second argument to skip those instead.
  */
 export class TeamController {
   private static readonly ROSTER: Record<string, BehaviourFactory> = {
-    BotA: () => new ExtractorPlacerOnResourceBehaviour("sugar_cane"),
-    BotB: () => new PumpPlacerOnResourceBehaviour("maple_syrup"),
+    BotA: () => new GathererBehaviour(),
+    BotB: () => new GoUpBehaviour(),
   };
 
   /** Used for any bot type not listed above. */

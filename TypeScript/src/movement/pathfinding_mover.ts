@@ -38,12 +38,21 @@ export class PathfindingMover implements IMover {
   private posBeforeMove: MessageProtocol.Position | null = null;
   private lastMoveTarget: MessageProtocol.Position | null = null;
   private refused = false;
+  /**
+   * Set when terrain leaves us no step to take at all, so we returned null
+   * instead of a move. It has to be reported as a refusal: behaviours notice
+   * they are wedged only through lastMoveRefused, and one that sees "not
+   * refused" every tick keeps waiting on a tile it can never reach. Kept apart
+   * from `refused` because observe() clears that one every tick, and a wedge
+   * nothing has moved us out of is still true next tick.
+   */
+  private terrainWedged = false;
   /** Who we are claiming tiles as. Read from the state, so nothing to plumb. */
   private owner = "bot";
   private waitTicks = 0;
 
   public get lastMoveRefused(): boolean {
-    return this.refused;
+    return this.refused || this.terrainWedged;
   }
 
   /**
@@ -126,6 +135,8 @@ export class PathfindingMover implements IMover {
     to: MessageProtocol.Position,
   ): MessageProtocol.MoveAction | null {
     if (from.X === to.X && from.Y === to.Y) {
+      // Standing on the target is not being wedged, whatever happened earlier.
+      this.terrainWedged = false;
       return null;
     }
 
@@ -168,6 +179,7 @@ export class PathfindingMover implements IMover {
     );
 
     if (!open) {
+      this.terrainWedged = true;
       return null;
     }
 
@@ -221,6 +233,7 @@ export class PathfindingMover implements IMover {
   ): MessageProtocol.MoveAction {
     TileClaims.reserve(this.owner, to, state.CurrentTick);
     this.waitTicks = 0;
+    this.terrainWedged = false;
     this.posBeforeMove = from;
     this.lastMoveTarget = to;
     return new MessageProtocol.MoveAction(to);

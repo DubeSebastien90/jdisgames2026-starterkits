@@ -64,9 +64,15 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
   private static readonly STUCK_LIMIT = 15;
 
   // Ticks to stand beside a locked node before writing this one off and looking
-  // for another. Sugarcane regen is 180s in the docs, so this is a long wait on
-  // purpose: walking away and back costs more than waiting it out.
-  private static readonly LOCKED_PATIENCE = 250;
+  // for another. The node's own RemainingTicks decides when it says something;
+  // these are the floor and the ceiling around it. Respawns run 180s (cotton
+  // candy) to 720s (soda) in the docs, so waiting is long on purpose: walking
+  // away and back costs more than waiting it out.
+  private static readonly LOCKED_PATIENCE_MIN = 250;
+  private static readonly LOCKED_PATIENCE_MAX = 800;
+  // Ticks of slack on top of a timer the node gave us, since it ticks down as
+  // we watch and the structure only becomes placeable once it hits zero.
+  private static readonly LOCKED_PATIENCE_MARGIN = 15;
   // While waiting, try placing anyway this often. The flag is what we go on, but
   // a refused action costs exactly one tick — the same as standing idle — so an
   // occasional probe is free insurance against a flag that lags the cooldown.
@@ -221,7 +227,7 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
     }
 
     const waited = state.CurrentTick - this.waitingSince;
-    if (waited > StructureOnResourceBehaviour.LOCKED_PATIENCE) {
+    if (waited > this.patienceFor(node)) {
       console.log(
         `[${this.tag}] Waited ${waited} ticks on node ${this.targetId}, giving up on it for now.`,
       );
@@ -253,6 +259,19 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
     }
 
     return null;
+  }
+
+  /**
+   * How long to hold the spot. The node's own countdown when it gives us one,
+   * clamped: a timer of 600 is worth waiting out, a timer the server never
+   * filled in is not worth standing there forever for.
+   */
+  private patienceFor(node: MessageProtocol.Resource): number {
+    const claimed = node.RemainingTicks + StructureOnResourceBehaviour.LOCKED_PATIENCE_MARGIN;
+    return Math.min(
+      StructureOnResourceBehaviour.LOCKED_PATIENCE_MAX,
+      Math.max(StructureOnResourceBehaviour.LOCKED_PATIENCE_MIN, claimed),
+    );
   }
 
   private place(
