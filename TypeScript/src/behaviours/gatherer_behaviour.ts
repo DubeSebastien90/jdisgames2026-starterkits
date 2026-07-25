@@ -394,8 +394,13 @@ export class GathererBehaviour implements IBehaviour {
     // Node tiles are never walkable, so "close enough" means adjacent. Never
     // try to stand on the node itself: the move is refused and we would spend
     // every tick bumping into it instead of ever calling Gather.
+    //
+    // Adjacent means orthogonally adjacent, hence manhattan and not chebyshev.
+    // A diagonal is chebyshev distance 1, and stopping there gets us a node we
+    // cannot reach: we would sit and mine thin air until STUCK_TICKS wrote off
+    // a node that was fine all along.
     const node = state.VisibleResources.find((r) => r.Id === this.targetId);
-    const distance = this.chebyshev(pos, target);
+    const distance = this.manhattan(pos, target);
 
     // Checked before the walk, not after it: a node can be emptied by someone
     // else while we are still on our way, and finishing the trip to an empty
@@ -422,7 +427,7 @@ export class GathererBehaviour implements IBehaviour {
     }
 
     if (distance > 1) {
-      return this.mover.step(state, pos, target);
+      return this.mover.step(state, pos, this.approachTile(state, pos, target));
     }
 
     if (!node) {
@@ -458,6 +463,31 @@ export class GathererBehaviour implements IBehaviour {
     this.lastNodeAmount = node.CurrentAmount;
 
     return new MessageProtocol.GatherNodeAction(target);
+  }
+
+  /**
+   * Where to actually walk when mining a node: the closest tile beside it we
+   * could stand on, not the node tile itself. Aiming at the node has the
+   * pathfinder route us to whichever tile it reaches first, diagonals included,
+   * and a diagonal is no use for gathering.
+   *
+   * Falls back to the node when none of the four look free — the pathfinder
+   * still closes the distance, and something will have moved by the time we
+   * get there.
+   */
+  private approachTile(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+    node: MessageProtocol.Position,
+  ): MessageProtocol.Position {
+    const sides = ALL_DIRECTIONS.map((direction) => {
+      const vector = DIRECTION_VECTORS[direction];
+      return new MessageProtocol.Position(node.X + vector.x, node.Y + vector.y);
+    })
+      .filter((side) => PathfindingMover.isPassable(state.getTileAt(side)))
+      .sort((a, b) => this.manhattan(pos, a) - this.manhattan(pos, b));
+
+    return sides[0] ?? node;
   }
 
   /** Walk home and drop everything into storage, then start over. */
