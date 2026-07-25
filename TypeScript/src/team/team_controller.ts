@@ -1,6 +1,7 @@
 import { IBehaviour } from "../behaviours/ibehaviour";
 import { GathererBehaviour } from "../behaviours/gatherer_behaviour";
 import { CompanionFarmerBehaviour } from "../behaviours/companion_farmer_behaviour";
+import { ExtractorPlacerBehaviour } from "../behaviours/extractor_placer_behaviour";
 // import { ScoutBehaviour } from "../behaviours/scout_behaviour";
 
 type BehaviourFactory = () => IBehaviour;
@@ -24,7 +25,7 @@ type BehaviourFactory = () => IBehaviour;
 export class TeamController {
   private static readonly ROSTER: Record<string, BehaviourFactory> = {
     BotA: () => new GathererBehaviour(),
-    BotB: () => new GathererBehaviour(),
+    BotB: () => new ExtractorPlacerBehaviour(),
   };
 
   /** Used for any bot type not listed above. */
