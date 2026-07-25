@@ -4,6 +4,7 @@ import { CompanionFarmerBehaviour } from "../behaviours/companion_farmer_behavio
 import { ExtractorPlacerBehaviour } from "../behaviours/extractor_placer_behaviour";
 import { PumpPlacerBehaviour } from "../behaviours/pump_placer_behaviour";
 import { ReturnToBaseBehaviour } from "../behaviours/return_to_base_behaviour";
+import { PlaceRadarBehaviour } from "../behaviours/place_radar_behaviour";
 // import { ScoutBehaviour } from "../behaviours/scout_behaviour";
 
 type BehaviourFactory = () => IBehaviour;
