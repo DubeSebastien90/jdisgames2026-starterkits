@@ -623,7 +623,7 @@ export class GameState {
   }
 
   private updateResources(data: ServerData): void {
-    this.VisibleResources = asArray(data.visibleResources).map(Resource.fromServer);
+    this.VisibleResources = asArray(data.resources).map(Resource.fromServer);
   }
 
   private updateResourcesDelta(data: ServerData): void {

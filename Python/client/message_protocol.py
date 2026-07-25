@@ -555,7 +555,7 @@ class GameState:
             self.VisibleCompanions.append(parsed)
 
     def _update_resources(self, data: dict[str, Any]) -> None:
-        self.VisibleResources = [Resource.from_dict(resource) for resource in _get(data, "visibleResources", []) or []]
+        self.VisibleResources = [Resource.from_dict(resource) for resource in _get(data, "resources", []) or []]
 
     def _update_resources_delta(self, data: dict[str, Any]) -> None:
         removed = set(_get(data, "removedResourceIds", []) or [])
