@@ -5,6 +5,7 @@ import { ExtractorPlacerBehaviour } from "../behaviours/extractor_placer_behavio
 import { PumpPlacerBehaviour } from "../behaviours/pump_placer_behaviour";
 import { ReturnToBaseBehaviour } from "../behaviours/return_to_base_behaviour";
 import { PlaceRadarBehaviour } from "../behaviours/place_radar_behaviour";
+import { GoUpBehaviour } from "../behaviours/go_up_behaviour";
 // import { ScoutBehaviour } from "../behaviours/scout_behaviour";
 // Straight-line probes, for looking at what is in one direction:
 // import { GoLeftBehaviour } from "../behaviours/go_left_behaviour";
@@ -32,7 +33,7 @@ type BehaviourFactory = () => IBehaviour;
  */
 export class TeamController {
   private static readonly ROSTER: Record<string, BehaviourFactory> = {
-    BotA: () => new CompanionFarmerBehaviour(),
+    BotA: () => new GoUpBehaviour(),
     BotB: () => new GathererBehaviour(),
   };
 
