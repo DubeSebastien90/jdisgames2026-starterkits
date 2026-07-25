@@ -310,15 +310,22 @@ export class GathererBehaviour implements IBehaviour {
     // Node tiles are never walkable, so "close enough" means adjacent. Never
     // try to stand on the node itself: the move is refused and we would spend
     // every tick bumping into it instead of ever calling Gather.
-    const distance = this.chebyshev(pos, target);
-    if (distance > 1) {
-      return this.stepToward(state, pos, target);
-    }
-
-    // Node gone or drained: take whatever we have home, or look for another.
     const node = state.VisibleResources.find((r) => r.Id === this.targetId);
-    if (!node || node.CurrentAmount <= 0) {
-      console.log(`[${this.tag}] Node depleted.`);
+    const distance = this.chebyshev(pos, target);
+
+    // Checked before the walk, not after it: a node can be emptied by someone
+    // else while we are still on our way, and finishing the trip to an empty
+    // node wastes the whole journey. A node that merely dropped out of vision
+    // is not treated as gone while we are still travelling, since we remember
+    // where it was.
+    const ranOut = node ? node.CurrentAmount <= 0 : distance <= 1;
+    if (ranOut) {
+      console.log(
+        `[${this.tag}] Node ${this.targetId} is empty` +
+          (carried > 0
+            ? `, taking ${carried} back to base.`
+            : `, picking another one${distance > 1 ? " (was still walking to it)" : ""}.`),
+      );
       this.releaseClaim();
       this.targetId = null;
       this.targetPosition = null;
@@ -326,6 +333,16 @@ export class GathererBehaviour implements IBehaviour {
       if (carried > 0) {
         return this.startReturn(state, pos, carried);
       }
+      this.phase = "seek";
+      return this.seek(state, pos);
+    }
+
+    if (distance > 1) {
+      return this.stepToward(state, pos, target);
+    }
+
+    if (!node) {
+      // Unreachable: adjacent with no visible node is handled by ranOut above.
       this.phase = "seek";
       return this.seek(state, pos);
     }
