@@ -51,7 +51,8 @@ export class CompanionFarmerBehaviour implements IBehaviour {
   private stationPlan: SpotPlan | null = null;
   private stationed = false;
   private withdrawTries = 0;
-  private lastCarried = 0;
+  /** Carried count when we asked, so the next tick can see if it worked. */
+  private withdrawIssuedAt: number | null = null;
   private oneAtATime = false;
   /**
    * Items a companion takes, measured rather than assumed, so Companion I/II/III
@@ -78,6 +79,7 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     const carried = this.carriedCount(bot);
 
     this.measureCapacity(carried);
+    this.observeWithdraw(carried);
 
     if (!this.stationPlan) {
       // Tiles just outside the hull: standable, and as close to the base as we
@@ -185,13 +187,7 @@ export class CompanionFarmerBehaviour implements IBehaviour {
       return null;
     }
 
-    // Something landed in the pack, so this tile and this request both work.
-    if (carried > this.lastCarried) {
-      this.withdrawTries = 0;
-    }
-    this.lastCarried = carried;
-
-    if (++this.withdrawTries > CompanionFarmerBehaviour.WITHDRAW_TRIES) {
+    if (this.withdrawTries > CompanionFarmerBehaviour.WITHDRAW_TRIES) {
       this.withdrawTries = 0;
       this.logWithdrawDiagnostic(state, pos, base, bot, carried);
 
@@ -215,8 +211,37 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     // so taking the first stack can mean fetching a single item per tick.
     const item = this.biggestStack(base);
     const quantity = this.oneAtATime ? 1 : item.Quantity;
+    this.withdrawIssuedAt = carried;
     console.log(`[${this.tag}] Withdrawing ${item.ItemName} x${quantity} from base.`);
     return new MessageProtocol.WithdrawFromBaseAction(item.ItemName, quantity);
+  }
+
+  /**
+   * Did the last withdraw arrive? Measured on the tick after the request and
+   * against what we held when we asked — not against the previous withdraw. A
+   * companion leaves with the items in between, so comparing across withdraws
+   * makes a working tile look broken and sends us wandering off it.
+   */
+  private observeWithdraw(carried: number): void {
+    if (this.withdrawIssuedAt === null) {
+      return;
+    }
+
+    const gained = carried - this.withdrawIssuedAt;
+    this.withdrawIssuedAt = null;
+
+    if (gained > 0) {
+      this.withdrawTries = 0;
+      if (this.oneAtATime) {
+        // The refusal was about where we stood, not the size of the request,
+        // and one item per tick is a fraction of the send rate.
+        console.log(`[${this.tag}] Withdraw works here; back to whole stacks.`);
+        this.oneAtATime = false;
+      }
+      return;
+    }
+
+    this.withdrawTries++;
   }
 
   private biggestStack(base: MessageProtocol.BaseInfo): MessageProtocol.ItemStack {

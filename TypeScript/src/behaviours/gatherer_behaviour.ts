@@ -47,6 +47,14 @@ export class GathererBehaviour implements IBehaviour {
   private static readonly FORCE_DEPOSIT = false;
   // Set false to go back to walking every load home yourself.
   private static readonly SHIP_BY_COMPANION = true;
+  // Skip nodes whose regen timer is still running: whatever is in them now is
+  // the tail end of a refill, so it is not worth the walk while other nodes
+  // sit at full stock. Set false to mine anything with a single item in it.
+  private static readonly SKIP_REGENERATING = true;
+  // Skip nodes with a pump or an extractor on them. A machine drains the node
+  // on its own and hands the loot straight to the base, so mining it by hand
+  // is just competing with our own structure for the same stock.
+  private static readonly SKIP_MACHINE_NODES = true;
 
   /** How this bot gets around. Swap for SidestepMover to change navigation. */
   private readonly mover: IMover = new PathfindingMover();
@@ -65,6 +73,12 @@ export class GathererBehaviour implements IBehaviour {
   private lastDepositCarried: number | null = null;
   private lastEmptyLogTick = -GathererBehaviour.EMPTY_LOG_EVERY;
   private readonly ignoredNodes = new Map<number, number>();
+  /**
+   * Nodes we have seen a pump or an extractor sitting on, so they stay skipped
+   * after they drop out of vision. Re-checked whenever the node is visible, so
+   * a destroyed machine puts the node back in play.
+   */
+  private readonly machineNodes = new Set<number>();
   private exploreDirection: Direction | null = null;
   private exploreTicksLeft = 0;
   private exploreCount = 0;
@@ -337,6 +351,12 @@ export class GathererBehaviour implements IBehaviour {
 
   /** Record everything in sight, so we can come back after a respawn. */
   private rememberVisibleNodes(state: MessageProtocol.GameState): void {
+    const machineTiles = new Set(
+      state.VisibleStructures.filter(
+        (structure) => structure.Type === "Pump" || structure.Type === "Extractor",
+      ).map((structure) => `${structure.Position.X},${structure.Position.Y}`),
+    );
+
     for (const resource of state.VisibleResources) {
       this.knownNodes.set(resource.Id, {
         name: resource.Name,
@@ -345,7 +365,33 @@ export class GathererBehaviour implements IBehaviour {
         respawnTicks: resource.RemainingTicks,
         seenTick: state.CurrentTick,
       });
+
+      // Both directions on purpose: a node we can see with no machine on it is
+      // fair game again, so a pump that got destroyed does not blacklist it for
+      // the rest of the match.
+      const key = `${resource.Position.X},${resource.Position.Y}`;
+      if (machineTiles.has(key)) {
+        if (!this.machineNodes.has(resource.Id)) {
+          console.log(
+            `[${this.tag}] ${resource.Name} at ${key} has a machine on it, leaving it to run itself.`,
+          );
+        }
+        this.machineNodes.add(resource.Id);
+      } else {
+        this.machineNodes.delete(resource.Id);
+      }
     }
+  }
+
+  /** True when this node is off limits: a machine works it, or it is refilling. */
+  private isSkipped(
+    id: number,
+    remainingTicks: number,
+  ): boolean {
+    if (GathererBehaviour.SKIP_MACHINE_NODES && this.machineNodes.has(id)) {
+      return true;
+    }
+    return GathererBehaviour.SKIP_REGENERATING && remainingTicks > 0;
   }
 
   /**
@@ -374,11 +420,19 @@ export class GathererBehaviour implements IBehaviour {
       if (TeamClaims.takenByOther(id, this.tag, state.CurrentTick)) {
         continue;
       }
+      if (GathererBehaviour.SKIP_MACHINE_NODES && this.machineNodes.has(id)) {
+        continue;
+      }
 
       // RemainingTicks is what the server told us at the time we looked.
       const age = state.CurrentTick - node.seenTick;
       const wait = node.respawnTicks > 0 ? node.respawnTicks : GathererBehaviour.RESPAWN_GUESS;
       if (node.amount <= 0 && age < wait) {
+        continue;
+      }
+      // Same rule as for visible nodes, aged forward: it was still refilling
+      // when we saw it, and by our reckoning it has not finished yet.
+      if (GathererBehaviour.SKIP_REGENERATING && age < node.respawnTicks) {
         continue;
       }
 
@@ -524,6 +578,24 @@ export class GathererBehaviour implements IBehaviour {
     if (carried >= GathererBehaviour.CARRY_TARGET || this.slotsFull(state.Bot)) {
       console.log(`[${this.tag}] Carrying ${carried}, heading back to base.`);
       return this.startReturn(state, pos, carried);
+    }
+
+    // A pump or extractor can land on our node while we walk to it (a teammate
+    // placing one, or an enemy). Drop it and find another rather than race a
+    // machine for the same stock.
+    if (
+      GathererBehaviour.SKIP_MACHINE_NODES &&
+      this.targetId !== null &&
+      this.machineNodes.has(this.targetId)
+    ) {
+      console.log(`[${this.tag}] Node ${this.targetId} now has a machine on it, picking another.`);
+      this.releaseClaim();
+      this.targetId = null;
+      this.targetPosition = null;
+      this.lastNodeAmount = null;
+      this.idleTicks = 0;
+      this.phase = "seek";
+      return this.seek(state, pos);
     }
 
     // Node tiles are never walkable, so "close enough" means adjacent. Never
@@ -777,6 +849,13 @@ export class GathererBehaviour implements IBehaviour {
         continue;
       }
 
+      // Only when looking for something to mine: the mustHaveStock=false pass
+      // exists to report which node we are waiting on, and that node is by
+      // definition one with a timer running.
+      if (mustHaveStock && this.isSkipped(resource.Id, resource.RemainingTicks)) {
+        continue;
+      }
+
       const ignoredUntil = this.ignoredNodes.get(resource.Id);
       if (ignoredUntil !== undefined && ignoredUntil > tick) {
         continue;
@@ -819,7 +898,8 @@ export class GathererBehaviour implements IBehaviour {
       .join(" | ");
 
     console.log(
-      `[${this.tag}] ${state.VisibleResources.length} node(s) visible, none with stock. ` +
+      `[${this.tag}] ${state.VisibleResources.length} node(s) visible, none worth mining ` +
+        `(empty, refilling, or machine-worked). ` +
         `Waiting at ${pos.X},${pos.Y} for ${waitingOn.Name} at ` +
         `${waitingOn.Position.X},${waitingOn.Position.Y}. [${summary}]`,
     );
