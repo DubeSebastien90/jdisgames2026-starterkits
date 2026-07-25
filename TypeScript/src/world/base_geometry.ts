@@ -78,6 +78,28 @@ export class BaseGeometry {
   }
 
   /**
+   * Steps from here to the hull, 0 when inside it. Manhattan, so a tile touching
+   * a corner diagonally counts as 2 and not 1 — the same reason gathering needs
+   * orthogonal adjacency. Gate base actions on this, not on distanceTo: a bot
+   * parked on a diagonal looks adjacent by chebyshev and has every deposit and
+   * withdraw refused.
+   */
+  public static stepsTo(
+    base: MessageProtocol.BaseInfo,
+    pos: MessageProtocol.Position,
+  ): number {
+    let best = Number.POSITIVE_INFINITY;
+
+    for (const rect of BaseGeometry.rects(base)) {
+      const dx = Math.max(rect.x - pos.X, 0, pos.X - (rect.x + rect.width - 1));
+      const dy = Math.max(rect.y - pos.Y, 0, pos.Y - (rect.y + rect.height - 1));
+      best = Math.min(best, dx + dy);
+    }
+
+    return best;
+  }
+
+  /**
    * Are we standing in our own base zone? The tile's zone is the authority when
    * we can see it, the rectangle is the fallback.
    *
