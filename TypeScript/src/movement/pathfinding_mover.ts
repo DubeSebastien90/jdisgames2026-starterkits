@@ -28,6 +28,13 @@ export class PathfindingMover implements IMover {
   private static readonly MAX_WAIT_TICKS = 3;
 
   private readonly blockedUntil = new Map<string, number>();
+  /**
+   * Liquid tiles we have ever seen. Vision is cleared and rebuilt every update,
+   * so without this a lake is forgotten the moment we walk past it and the next
+   * route plans straight back through it — the bot then rediscovers the shore
+   * one refused move at a time. Terrain never changes, so this never goes stale.
+   */
+  private readonly knownLiquid = new Set<string>();
   private posBeforeMove: MessageProtocol.Position | null = null;
   private lastMoveTarget: MessageProtocol.Position | null = null;
   private refused = false;
@@ -72,6 +79,7 @@ export class PathfindingMover implements IMover {
   ): void {
     this.owner = state.Bot?.BotType || this.owner;
     TileClaims.hold(this.owner, pos, state.CurrentTick);
+    this.rememberLiquid(state);
 
     const from = this.posBeforeMove;
     const to = this.lastMoveTarget;
@@ -90,6 +98,18 @@ export class PathfindingMover implements IMover {
         ? PathfindingMover.ENTITY_BLOCK_TTL
         : PathfindingMover.BLOCK_TTL;
       this.blockedUntil.set(`${to.X},${to.Y}`, state.CurrentTick + ttl);
+    }
+  }
+
+  /** Note every liquid tile in sight, so it stays off the map for good. */
+  private rememberLiquid(state: MessageProtocol.GameState): void {
+    for (const [key, tile] of state.VisibleTiles) {
+      if (!PathfindingMover.isPassable(tile)) {
+        const category = tile.TerrainCategory.toLowerCase();
+        if (category.includes("liquid") || category.includes("water")) {
+          this.knownLiquid.add(key);
+        }
+      }
     }
   }
 
@@ -257,7 +277,14 @@ export class PathfindingMover implements IMover {
     pos: MessageProtocol.Position,
     respectClaims: boolean,
   ): boolean {
-    const blockedUntil = this.blockedUntil.get(`${pos.X},${pos.Y}`);
+    const key = `${pos.X},${pos.Y}`;
+
+    // Remembered from an earlier sighting, even though we cannot see it now.
+    if (this.knownLiquid.has(key)) {
+      return false;
+    }
+
+    const blockedUntil = this.blockedUntil.get(key);
     if (blockedUntil !== undefined && blockedUntil > state.CurrentTick) {
       return false;
     }
