@@ -4,11 +4,12 @@ import { IMover } from "../movement/imover";
 import { PathfindingMover } from "../movement/pathfinding_mover";
 import { BaseGeometry } from "../world/base_geometry";
 
-/** A list of candidate tiles walked in order, moving on when one is a dead end. */
+/** Candidate tiles to farm from, walked in order until one of them works. */
 interface SpotPlan {
   spots: MessageProtocol.Position[];
   index: number;
   stuckTicks: number;
+  cycled: boolean;
 }
 
 /**
@@ -19,41 +20,57 @@ interface SpotPlan {
  * The items come out of storage and the companions put them straight back, so
  * nothing is consumed — the only real cost is a tick per send.
  *
- * It parks against the hull and never moves again. Only one action fits in a
- * tick (see GameClient), so every tick spent walking is a companion not sent,
- * and standing next to the base is also the shortest possible trip home for a
- * companion, which is what frees its slot for the next one.
+ * It settles on one tile and never moves again. Only one action fits in a tick
+ * (see GameClient), so every tick spent walking is a companion not sent, and
+ * standing at the base is also the shortest trip home for a companion, which is
+ * what frees its slot for the next one.
  */
 export class CompanionFarmerBehaviour implements IBehaviour {
   public readonly name = "companion-farmer";
 
-  // Refused moves in a row before we decide a candidate tile is unreachable and
-  // try the next one. The hull blocks a lot of tiles, and the server does not
-  // tell us which reading of BaseInfo.Position is the right one.
+  // Refused moves in a row before we decide a candidate tile is unreachable.
   private static readonly STUCK_TICKS = 6;
-  // Touching the hull is close enough for base actions: a deposit has been seen
-  // to succeed from a tile just outside it, and the inside is not walkable.
-  // Measured in steps, so a tile touching a corner diagonally does not count.
-  private static readonly BASE_RANGE = 1;
-  // Withdraw requests that changed nothing before we accept it is not working
-  // from here. Without this a refused withdraw is silent and repeats for ever.
-  private static readonly WITHDRAW_TRIES = 5;
+  // Withdraw requests that changed nothing before we try something else.
+  private static readonly WITHDRAW_TRIES = 3;
+  // The server refuses a withdraw asking for more than this, whole stack or not
+  // — a request for Sugar Cane x100 fails where x10 succeeds. Learned downward
+  // from what actually arrives, so a smaller real cap sorts itself out.
+  private static readonly MAX_WITHDRAW = 10;
   // Rounds of companions to keep in the pack. Enough to fill every slot without
   // emptying storage, which the crafting and market side of the base needs.
   private static readonly LOADS_IN_HAND = 2;
   // Ticks between "storage is empty" reports, so waiting is not spammy.
   private static readonly EMPTY_LOG_EVERY = 25;
+  // Fetch a load, walk away from the base, then dump the whole load as sends.
+  //
+  // Standing inside the base and sending from there is about twice as fast per
+  // send, but a companion then arrives within a tick, so only one is ever in
+  // flight and "Mini-Mes" (2/4/6 at once) can never be earned. Walking out puts
+  // the whole load in the air at the same time. Set false for pure send rate.
+  private static readonly SHUTTLE = true;
+  // How far to get from the base before sending. A companion needs about this
+  // many ticks to walk home, which is what keeps that many of them travelling.
+  private static readonly SHUTTLE_DISTANCE = 6;
 
   /** Shared navigation: routes around trees, hulls and other bots. */
   private readonly mover: IMover = new PathfindingMover();
 
   private tag = "bot";
-  private stationPlan: SpotPlan | null = null;
-  private stationed = false;
+  private plan: SpotPlan | null = null;
+  /** Set once a withdraw has worked here, after which we never move again. */
+  private stationLocked = false;
+  private announcedStation = false;
+  private withdrawCap = CompanionFarmerBehaviour.MAX_WITHDRAW;
+  /**
+   * Which spelling of the item name we are trying. Storage reports a display
+   * name ("Sugar Cane") while the rest of the protocol speaks in ids
+   * ("sugar_cane"), and only one of them may be what WithdrawFromBase wants.
+   */
+  private variantIndex = 0;
   private withdrawTries = 0;
-  /** Carried count when we asked, so the next tick can see if it worked. */
+  /** What we held and asked for, so the next tick can see if it worked. */
   private withdrawIssuedAt: number | null = null;
-  private oneAtATime = false;
+  private withdrawRequested = 0;
   /**
    * Items a companion takes, measured rather than assumed, so Companion I/II/III
    * are picked up on their own. Only used to size the pack.
@@ -63,6 +80,16 @@ export class CompanionFarmerBehaviour implements IBehaviour {
   private sends = 0;
   private refusedSends = 0;
   private lastEmptyLogTick = -CompanionFarmerBehaviour.EMPTY_LOG_EVERY;
+  /** Where to stand to launch, far enough out that companions pile up. */
+  private padSpot: MessageProtocol.Position | null = null;
+  private announcedPad = false;
+  /**
+   * Set once every companion slot has been in the air at the same time.
+   * "Mini-Mes" is a one-off — 2, 4 and 6 at once, and 6 covers all three — so
+   * once it has happened there is nothing left to buy by walking out, and we
+   * switch to the faster send-from-inside loop for the rest of the match.
+   */
+  private allSlotsSeenFull = false;
 
   public getNextAction(state: MessageProtocol.GameState): MessageProtocol.ActionBase | null {
     if (!state.Bot || !state.Base || !state.Team) {
@@ -79,38 +106,53 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     const carried = this.carriedCount(bot);
 
     this.measureCapacity(carried);
-    this.observeWithdraw(carried);
+    this.observeWithdraw(carried, pos);
 
-    if (!this.stationPlan) {
-      // Tiles just outside the hull: standable, and as close to the base as we
-      // can get, since the interior is not walkable.
-      this.stationPlan = { spots: BaseGeometry.perimeterTiles(base, "right"), index: 0, stuckTicks: 0 };
+
+    if (!this.plan) {
+      // Inside the hull first, under both readings of BaseInfo.Position, then
+      // the tiles around it as a fallback in case standing inside is not what
+      // the server actually wants.
+      this.plan = {
+        spots: [...BaseGeometry.interiorTiles(base), ...BaseGeometry.perimeterTiles(base, "right")],
+        index: 0,
+        stuckTicks: 0,
+        cycled: false,
+      };
       console.log(
         `[${this.tag}] Base ${base.Position.X},${base.Position.Y} ${base.Width}x${base.Height}: ` +
-          `stationing at ${this.describe(this.stationPlan)}.`,
+          `${this.plan.spots.length} candidate tiles, starting with ${this.describe()}.`,
       );
     }
 
-    // Walk in once, then stay put for the rest of the match.
-    if (BaseGeometry.stepsTo(base, pos) > CompanionFarmerBehaviour.BASE_RANGE) {
-      this.stationed = false;
-      return this.mover.step(state, pos, this.target(state, this.stationPlan));
+    // Carrying a load: walk it clear of the base, then launch the lot.
+    if (carried > 0 && CompanionFarmerBehaviour.SHUTTLE && !this.allSlotsSeenFull) {
+      return this.launch(state, pos, base, team, carried);
     }
 
-    if (!this.stationed) {
-      this.stationed = true;
-      console.log(`[${this.tag}] Stationed at ${pos.X},${pos.Y}, farming companions.`);
-    }
-
-    // Sending outranks everything: it is the badge, and it frees pack space.
+    // Sending works anywhere and is the whole point, so it always goes first.
     if (carried > 0 && team.CompanionNumber < team.CompanionSlots) {
       return this.send(team, carried);
     }
 
-    // Every slot busy, or nothing to hand one. Either way, topping the pack up
-    // is the useful thing to do with the tick.
-    const wanted = this.packTarget(team);
-    if (carried < wanted && base.Inventory.length > 0) {
+    // Walk to the tile we are currently betting on.
+    const station = this.target(state);
+    if (pos.X !== station.X || pos.Y !== station.Y) {
+      this.announcedStation = false;
+      return this.mover.step(state, pos, station);
+    }
+
+    if (!this.announcedStation) {
+      this.announcedStation = true;
+      console.log(
+        `[${this.tag}] At ${pos.X},${pos.Y} (inside=${BaseGeometry.contains(base, pos)}), ` +
+          `${this.stationLocked ? "locked in" : "trying a withdraw"}.`,
+      );
+    }
+
+    // Every slot busy, or nothing to hand one. Topping the pack up is the
+    // useful thing to do with the tick either way.
+    if (carried < this.packTarget(team) && base.Inventory.length > 0) {
       return this.withdraw(state, pos, base, bot, carried);
     }
 
@@ -118,9 +160,58 @@ export class CompanionFarmerBehaviour implements IBehaviour {
       this.logEmptyStorage(state, base);
     }
 
-    // Pack is stocked and every companion is out. Nothing to do but wait for a
-    // slot, which is the throughput ceiling of this whole strategy.
     return null;
+  }
+
+  // ─── Launching ──────────────────────────────────────────────────────────────
+
+  /**
+   * Get clear of the base, then send the whole load from there so every
+   * companion is walking home at the same time.
+   *
+   * The distance is checked rather than the tile, so it starts sending as soon
+   * as it is far enough even if the exact pad tile turns out to be unreachable.
+   */
+  private launch(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+    base: MessageProtocol.BaseInfo,
+    team: MessageProtocol.TeamInfo,
+    carried: number,
+  ): MessageProtocol.ActionBase | null {
+    if (this.manhattan(pos, base.Position) < CompanionFarmerBehaviour.SHUTTLE_DISTANCE) {
+      this.announcedPad = false;
+      return this.mover.step(state, pos, this.pad(base));
+    }
+
+    if (!this.announcedPad) {
+      this.announcedPad = true;
+      console.log(`[${this.tag}] At the pad ${pos.X},${pos.Y} with ${carried}, launching.`);
+    }
+
+    if (team.CompanionNumber < team.CompanionSlots) {
+      return this.send(team, carried);
+    }
+
+    // Every slot in the air at once, which is the whole point of walking out.
+    return null;
+  }
+
+  private pad(base: MessageProtocol.BaseInfo): MessageProtocol.Position {
+    if (!this.padSpot) {
+      const half = Math.floor(Math.max(base.Width, 1) / 2);
+      this.padSpot = new MessageProtocol.Position(
+        base.Position.X + half + CompanionFarmerBehaviour.SHUTTLE_DISTANCE,
+        base.Position.Y,
+      );
+      console.log(`[${this.tag}] Launch pad set to ${this.padSpot.X},${this.padSpot.Y}.`);
+    }
+
+    return this.padSpot;
+  }
+
+  private manhattan(a: MessageProtocol.Position, b: MessageProtocol.Position): number {
+    return Math.abs(a.X - b.X) + Math.abs(a.Y - b.Y);
   }
 
   // ─── Sending ────────────────────────────────────────────────────────────────
@@ -132,10 +223,21 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     this.sentAtCarried = carried;
     this.sends++;
 
+    const inFlight = team.CompanionNumber + 1;
     console.log(
       `[${this.tag}] Companion ${this.sends} away (${carried} in hand, ` +
-        `${team.CompanionNumber + 1}/${team.CompanionSlots} slots in use).`,
+        `${inFlight}/${team.CompanionSlots} slots in use).`,
     );
+
+    // Counted here, not from the state: the state we are handed always predates
+    // our own action, so the tick that fills the last slot never reports it.
+    if (!this.allSlotsSeenFull && inFlight >= team.CompanionSlots) {
+      this.allSlotsSeenFull = true;
+      console.log(
+        `[${this.tag}] That is all ${team.CompanionSlots} in the air at once — Mini-Mes banked. ` +
+          "No more walking out; sending from the base is twice the rate.",
+      );
+    }
 
     return new MessageProtocol.SendCompanionAction();
   }
@@ -187,33 +289,88 @@ export class CompanionFarmerBehaviour implements IBehaviour {
       return null;
     }
 
-    if (this.withdrawTries > CompanionFarmerBehaviour.WITHDRAW_TRIES) {
+    if (this.withdrawTries >= CompanionFarmerBehaviour.WITHDRAW_TRIES) {
       this.withdrawTries = 0;
       this.logWithdrawDiagnostic(state, pos, base, bot, carried);
-
-      if (!this.oneAtATime) {
-        // A request for more than fits is a plausible refusal, so drop to a
-        // single item before blaming where we are standing.
-        console.log(`[${this.tag}] Retrying one item at a time.`);
-        this.oneAtATime = true;
-      } else {
-        // Still nothing: we are probably not as "at base" as we think.
-        const plan = this.stationPlan!;
-        plan.index = (plan.index + 1) % plan.spots.length;
-        console.log(`[${this.tag}] Restationing at ${this.describe(plan)} and trying again.`);
-        this.stationed = false;
-        return this.mover.step(state, pos, this.target(state, plan));
-      }
+      return this.escalate(state, pos, this.nameVariants(this.biggestStack(base).ItemName).length);
     }
 
-    // The biggest stack, not the first one. A withdraw costs a tick whatever
-    // its size, and storage fills up with dribs and drabs as companions arrive,
-    // so taking the first stack can mean fetching a single item per tick.
+    // The biggest stack, not the first one: a withdraw costs a tick whatever its
+    // size, and storage fills with dribs and drabs as companions arrive.
     const item = this.biggestStack(base);
-    const quantity = this.oneAtATime ? 1 : item.Quantity;
+    const quantity = Math.min(item.Quantity, this.withdrawCap);
+    const name = this.nameVariants(item.ItemName)[this.variantIndex];
+
     this.withdrawIssuedAt = carried;
-    console.log(`[${this.tag}] Withdrawing ${item.ItemName} x${quantity} from base.`);
-    return new MessageProtocol.WithdrawFromBaseAction(item.ItemName, quantity);
+    this.withdrawRequested = quantity;
+    console.log(
+      `[${this.tag}] Withdrawing "${name}" x${quantity} from base` +
+        (name === item.ItemName ? "." : ` (storage calls it "${item.ItemName}").`),
+    );
+
+    return new MessageProtocol.WithdrawFromBaseAction(name, quantity);
+  }
+
+  /**
+   * Spellings of an item name to try, in order: exactly what storage reported,
+   * then the id form the rest of the protocol uses (resources come through as
+   * "sugar_cane", tiles as "cotton_candy"), then plain lower case.
+   */
+  private nameVariants(itemName: string): string[] {
+    const snake = itemName.trim().replace(/\s+/g, "_").toLowerCase();
+    const lower = itemName.trim().toLowerCase();
+    return [...new Set([itemName, snake, lower])];
+  }
+
+  /**
+   * Nothing is coming out of storage. Work through the three things it could
+   * be, cheapest first: the spelling of the item name, then where we are
+   * standing, then how much we asked for.
+   */
+  private escalate(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+    variants: number,
+  ): MessageProtocol.ActionBase | null {
+    const plan = this.plan!;
+
+    // Cheapest to rule out, and it costs no movement: try the other spellings
+    // from right here before deciding the tile is wrong.
+    if (this.variantIndex + 1 < variants) {
+      this.variantIndex++;
+      console.log(`[${this.tag}] Trying the item name a different way.`);
+      return null;
+    }
+    this.variantIndex = 0;
+
+    if (!plan.cycled) {
+      plan.index = (plan.index + 1) % plan.spots.length;
+      if (plan.index === 0) {
+        plan.cycled = true;
+      }
+      console.log(
+        `[${this.tag}] No luck here; trying ${this.describe()} ` +
+          `(${plan.index + 1}/${plan.spots.length}).`,
+      );
+      this.announcedStation = false;
+      return this.mover.step(state, pos, this.target(state));
+    }
+
+    if (this.withdrawCap > 1) {
+      this.withdrawCap = Math.max(Math.floor(this.withdrawCap / 2), 1);
+      plan.cycled = false;
+      console.log(
+        `[${this.tag}] Every tile refused x${this.withdrawCap * 2}. ` +
+          `Starting again asking for x${this.withdrawCap}.`,
+      );
+      return null;
+    }
+
+    console.log(
+      `[${this.tag}] Every tile refused even a single item. Read the [SERVER] Error ` +
+        "lines: this is not about where we are standing or how much we asked for.",
+    );
+    return null;
   }
 
   /**
@@ -222,26 +379,35 @@ export class CompanionFarmerBehaviour implements IBehaviour {
    * companion leaves with the items in between, so comparing across withdraws
    * makes a working tile look broken and sends us wandering off it.
    */
-  private observeWithdraw(carried: number): void {
+  private observeWithdraw(carried: number, pos: MessageProtocol.Position): void {
     if (this.withdrawIssuedAt === null) {
       return;
     }
 
     const gained = carried - this.withdrawIssuedAt;
+    const requested = this.withdrawRequested;
     this.withdrawIssuedAt = null;
 
-    if (gained > 0) {
-      this.withdrawTries = 0;
-      if (this.oneAtATime) {
-        // The refusal was about where we stood, not the size of the request,
-        // and one item per tick is a fraction of the send rate.
-        console.log(`[${this.tag}] Withdraw works here; back to whole stacks.`);
-        this.oneAtATime = false;
-      }
+    if (gained <= 0) {
+      this.withdrawTries++;
       return;
     }
 
-    this.withdrawTries++;
+    this.withdrawTries = 0;
+
+    if (!this.stationLocked) {
+      this.stationLocked = true;
+      console.log(
+        `[${this.tag}] Withdraw works from ${pos.X},${pos.Y} with name variant ` +
+          `${this.variantIndex + 1} — staying here for good.`,
+      );
+    }
+
+    // Got some but not all of it: that is the real per-request cap.
+    if (gained < requested) {
+      console.log(`[${this.tag}] Asked for ${requested}, got ${gained}. Capping requests there.`);
+      this.withdrawCap = gained;
+    }
   }
 
   private biggestStack(base: MessageProtocol.BaseInfo): MessageProtocol.ItemStack {
@@ -253,14 +419,17 @@ export class CompanionFarmerBehaviour implements IBehaviour {
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
   /**
-   * The tile we are walking to. Skips tiles we can see are impassable, and
-   * gives up on one that keeps refusing us — the hull is in the way of some of
-   * these candidates by definition.
+   * The tile we are betting on. Once a withdraw has worked we never leave it.
+   * Otherwise, skip tiles we can see are impassable and give up on one that
+   * keeps refusing to let us in — the hull's own machines block some of them.
    */
-  private target(
-    state: MessageProtocol.GameState,
-    plan: SpotPlan,
-  ): MessageProtocol.Position {
+  private target(state: MessageProtocol.GameState): MessageProtocol.Position {
+    const plan = this.plan!;
+
+    if (this.stationLocked) {
+      return plan.spots[plan.index];
+    }
+
     if (this.mover.lastMoveRefused) {
       plan.stuckTicks++;
     } else {
@@ -271,7 +440,7 @@ export class CompanionFarmerBehaviour implements IBehaviour {
       plan.stuckTicks = 0;
       plan.index = (plan.index + 1) % plan.spots.length;
       console.log(
-        `[${this.tag}] Cannot get to ${this.describe(plan)}; trying the next tile ` +
+        `[${this.tag}] Cannot get to ${this.describe()}; trying the next tile ` +
           `(${plan.index + 1}/${plan.spots.length}).`,
       );
     }
@@ -291,7 +460,8 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     return bot.Inventory.reduce((total, stack) => total + stack.Quantity, 0);
   }
 
-  private describe(plan: SpotPlan): string {
+  private describe(): string {
+    const plan = this.plan!;
     const spot = plan.spots[plan.index];
     return `${spot.X},${spot.Y}`;
   }
@@ -324,12 +494,13 @@ export class CompanionFarmerBehaviour implements IBehaviour {
       .join(", ");
 
     console.log(`=== [${this.tag}] withdraw diagnostic ===`);
-    console.log(`  bot at        : ${pos.X},${pos.Y}  (station ${this.describe(this.stationPlan!)})`);
+    console.log(`  bot at        : ${pos.X},${pos.Y}  (candidate ${this.describe()})`);
     console.log(`  base.Position : ${base.Position.X},${base.Position.Y} ${base.Width}x${base.Height}`);
     console.log(
-      `  stepsTo hull  : ${BaseGeometry.stepsTo(base, pos)} ` +
-        `(chebyshev=${BaseGeometry.distanceTo(base, pos)}, inside=${BaseGeometry.contains(base, pos)})`,
+      `  inside hull   : ${BaseGeometry.contains(base, pos)} ` +
+        `(steps=${BaseGeometry.stepsTo(base, pos)}, chebyshev=${BaseGeometry.distanceTo(base, pos)})`,
     );
+    console.log(`  asked for     : x${this.withdrawRequested} (cap x${this.withdrawCap})`);
     console.log(`  carrying      : ${carried} in ${bot.Inventory.length}/${bot.Slots} slots`);
     console.log(`  base storage  : ${base.Inventory.length}/${base.StorageSlots} stacks [${storage}]`);
     console.log(
