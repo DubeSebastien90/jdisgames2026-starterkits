@@ -1,5 +1,7 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
+import { IMover } from "../movement/imover";
+import { PathfindingMover } from "../movement/pathfinding_mover";
 
 type Phase = "withdraw" | "move" | "send";
 
@@ -13,6 +15,9 @@ type Phase = "withdraw" | "move" | "send";
 export class CompanionFarmerBehaviour implements IBehaviour {
   public readonly name = "companion-farmer";
 
+  /** Shared navigation: routes around trees, hulls and other bots. */
+  private readonly mover: IMover = new PathfindingMover();
+
   private phase: Phase = "withdraw";
   private tag = "bot";
   private standbyPos: MessageProtocol.Position | null = null;
@@ -23,6 +28,7 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     }
 
     this.tag = state.Bot.BotType || "bot";
+    this.mover.observe(state, state.Bot.Position);
 
     const pos = state.Bot.Position;
     const base = state.Base;
@@ -37,10 +43,10 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     }
 
     if (this.phase === "withdraw") {
-      return this.doWithdraw(pos, base, state.Bot);
+      return this.doWithdraw(state, pos, base, state.Bot);
     }
     if (this.phase === "move") {
-      return this.doMove(pos, this.standbyPos);
+      return this.doMove(state, pos, this.standbyPos);
     }
     return this.doSend(state.Bot, state.Team);
   }
@@ -48,12 +54,13 @@ export class CompanionFarmerBehaviour implements IBehaviour {
   // ─── Phase: withdraw ────────────────────────────────────────────────────────
 
   private doWithdraw(
+    state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
     base: MessageProtocol.BaseInfo,
     bot: MessageProtocol.PlayerInfo,
   ): MessageProtocol.ActionBase | null {
     if (!this.onBase(pos, base)) {
-      return this.stepToward(pos, base.Position);
+      return this.mover.step(state, pos, base.Position);
     }
 
     const freeSlots = bot.Slots > 0 ? bot.Slots - bot.Inventory.length : 10 - bot.Inventory.length;
@@ -74,6 +81,7 @@ export class CompanionFarmerBehaviour implements IBehaviour {
   // ─── Phase: move ────────────────────────────────────────────────────────────
 
   private doMove(
+    state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
     target: MessageProtocol.Position,
   ): MessageProtocol.ActionBase | null {
@@ -82,7 +90,7 @@ export class CompanionFarmerBehaviour implements IBehaviour {
       this.phase = "send";
       return null;
     }
-    return this.stepToward(pos, target);
+    return this.mover.step(state, pos, target);
   }
 
   // ─── Phase: send ────────────────────────────────────────────────────────────
@@ -124,16 +132,4 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     );
   }
 
-  private stepToward(
-    from: MessageProtocol.Position,
-    to: MessageProtocol.Position,
-  ): MessageProtocol.MoveAction {
-    const dx = to.X - from.X;
-    const dy = to.Y - from.Y;
-    const next =
-      Math.abs(dx) >= Math.abs(dy)
-        ? new MessageProtocol.Position(from.X + Math.sign(dx), from.Y)
-        : new MessageProtocol.Position(from.X, from.Y + Math.sign(dy));
-    return new MessageProtocol.MoveAction(next);
-  }
 }

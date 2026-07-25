@@ -1,5 +1,7 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
+import { IMover } from "../movement/imover";
+import { PathfindingMover } from "../movement/pathfinding_mover";
 import { TeamClaims } from "../team/team_claims";
 import {
   ALL_DIRECTIONS,
@@ -25,15 +27,6 @@ export class GathererBehaviour implements IBehaviour {
   private static readonly DEPOSIT_TRIES = 3;
   // How far from the ship still counts as "at the ship" when we get wedged.
   private static readonly NEAR_BASE_RANGE = 2;
-  // Pathfinding: how far from the bot to search, and a hard cap on the work.
-  private static readonly PATH_RADIUS = 25;
-  private static readonly PATH_MAX_NODES = 4000;
-  // A tile that refused us is avoided for this long. Expires because the
-  // blocker is often another bot, which will have moved on by then.
-  private static readonly BLOCK_TTL = 30;
-  // Much shorter when the blocker was another bot: it walks away on its own,
-  // and avoiding its tile for 30 ticks pushes us into silly detours.
-  private static readonly ENTITY_BLOCK_TTL = 3;
   // How far ahead to aim when exploring for resources.
   private static readonly SEEK_AHEAD = 12;
   // Ticks committed to one heading before reconsidering, so the bot actually
@@ -49,14 +42,9 @@ export class GathererBehaviour implements IBehaviour {
   // DEBUG: ignore the seek/gather/return logic below and just send
   // DepositToBase every tick, wherever we stand. Set back to false for play.
   private static readonly FORCE_DEPOSIT = false;
-  // Master switch for the sidestep-when-blocked behaviour below. Off: the
-  // pathfinder covers this now. Flip to true to re-enable.
-  private static readonly USE_DETOUR = false;
-  // Sidestep this many tiles when a move gets refused (usually a resource node
-  // sitting in the way), then go back to normal navigation.
-  private static readonly DETOUR_STEPS = 5;
-  // Each repeated failure sidesteps another DETOUR_STEPS tiles, up to this many.
-  private static readonly MAX_DETOUR_ATTEMPTS = 4;
+
+  /** How this bot gets around. Swap for SidestepMover to change navigation. */
+  private readonly mover: IMover = new PathfindingMover();
 
   private tag = "bot";
   private phase: Phase = "seek";
@@ -68,18 +56,8 @@ export class GathererBehaviour implements IBehaviour {
   private depositSpots: MessageProtocol.Position[] | null = null;
   private probeIndex = 0;
   private depositTicks = 0;
-  private posBeforeMove: MessageProtocol.Position | null = null;
-  private lastMoveTarget: MessageProtocol.Position | null = null;
-  private detourRemaining = 0;
-  private detourDelta: { x: number; y: number } | null = null;
-  private detourSide = 1;
-  private detourAttempts = 0;
   private depositLocked = false;
   private lastDepositCarried: number | null = null;
-  private moveRefused = false;
-  private refusedFrom: MessageProtocol.Position | null = null;
-  private refusedTo: MessageProtocol.Position | null = null;
-  private readonly blockedUntil = new Map<string, number>();
   private lastEmptyLogTick = -GathererBehaviour.EMPTY_LOG_EVERY;
   private readonly ignoredNodes = new Map<number, number>();
   private exploreDirection: Direction | null = null;
@@ -116,20 +94,8 @@ export class GathererBehaviour implements IBehaviour {
       return this.forceDeposit(state, pos, carried);
     }
 
-    // Did last tick's move actually happen?
-    this.updateMoveOutcome(state, pos);
-
-    if (GathererBehaviour.USE_DETOUR) {
-      this.checkIfStuck();
-    }
-
-    // A detour in progress outranks everything else until it finishes.
-    if (GathererBehaviour.USE_DETOUR && this.detourRemaining > 0 && this.detourDelta) {
-      this.detourRemaining--;
-      const side = this.detourDelta;
-      console.log(`[${this.tag}] Detour step, ${this.detourRemaining} left.`);
-      return this.move(pos, new MessageProtocol.Position(pos.X + side.x, pos.Y + side.y));
-    }
+    // Let the mover see whether last tick's move actually happened.
+    this.mover.observe(state, pos);
 
     // Checked in every phase, so a bot that starts (or restarts) already
     // loaded heads home instead of wandering off with a full pack.
@@ -152,98 +118,8 @@ export class GathererBehaviour implements IBehaviour {
     return this.returnToBase(state, pos, carried);
   }
 
-  /**
-   * If the move we asked for last tick left us on the same tile, something is
-   * in the way (usually a resource node). Sidestep perpendicular to whatever
-   * direction we were trying to go.
-   */
-  private checkIfStuck(): void {
-    const from = this.refusedFrom;
-    const to = this.refusedTo;
-    if (!this.moveRefused || !from || !to) {
-      return;
-    }
 
-    // Wedged during the sidestep itself: back out the other way.
-    if (this.detourRemaining > 0 && this.detourDelta) {
-      this.detourDelta = { x: -this.detourDelta.x, y: -this.detourDelta.y };
-      this.detourRemaining = GathererBehaviour.DETOUR_STEPS;
-      console.log(`[${this.tag}] Sidestep blocked too, reversing.`);
-      return;
-    }
 
-    // Blocked again right after a detour means the obstacle is longer than we
-    // thought, so keep going the same way and reach further each time.
-    this.detourAttempts = Math.min(
-      this.detourAttempts + 1,
-      GathererBehaviour.MAX_DETOUR_ATTEMPTS,
-    );
-
-    const wasHorizontal = to.X !== from.X;
-    this.detourDelta = wasHorizontal
-      ? { x: 0, y: this.detourSide }
-      : { x: this.detourSide, y: 0 };
-    this.detourRemaining = GathererBehaviour.DETOUR_STEPS * this.detourAttempts;
-
-    console.log(
-      `[${this.tag}] Move to ${to.X},${to.Y} refused. Sidestepping ${this.detourRemaining} ` +
-        `tiles (${this.detourDelta.x},${this.detourDelta.y}).`,
-    );
-  }
-
-  /**
-   * Compare where we are against the move we asked for last tick. Runs every
-   * tick regardless of USE_DETOUR, because the deposit logic needs to know
-   * when we are wedged too.
-   */
-  private updateMoveOutcome(
-    state: MessageProtocol.GameState,
-    pos: MessageProtocol.Position,
-  ): void {
-    const tick = state.CurrentTick;
-    const from = this.posBeforeMove;
-    const to = this.lastMoveTarget;
-    this.posBeforeMove = null;
-    this.lastMoveTarget = null;
-    this.moveRefused = false;
-    this.refusedFrom = null;
-    this.refusedTo = null;
-
-    if (!from || !to) {
-      return;
-    }
-
-    if (pos.X === from.X && pos.Y === from.Y) {
-      this.moveRefused = true;
-      this.refusedFrom = from;
-      this.refusedTo = to;
-
-      // Remember it so the next path plans around it. A bot in the way clears
-      // in a couple of ticks, while a tree does not, so do not sulk about a
-      // teammate's tile for as long as we would about scenery.
-      const blocker = state.getTileAt(to);
-      const ttl = blocker?.HasEntity
-        ? GathererBehaviour.ENTITY_BLOCK_TTL
-        : GathererBehaviour.BLOCK_TTL;
-      this.blockedUntil.set(`${to.X},${to.Y}`, tick + ttl);
-      return;
-    }
-
-    // Moving normally again, so the obstacle is behind us.
-    if (this.detourRemaining === 0) {
-      this.detourAttempts = 0;
-    }
-  }
-
-  /** Every move goes through here so we can tell next tick whether it worked. */
-  private move(
-    from: MessageProtocol.Position,
-    to: MessageProtocol.Position,
-  ): MessageProtocol.MoveAction {
-    this.posBeforeMove = from;
-    this.lastMoveTarget = to;
-    return new MessageProtocol.MoveAction(to);
-  }
 
   /**
    * DEBUG path for FORCE_DEPOSIT: hammer DepositToBase every tick and report
@@ -303,7 +179,7 @@ export class GathererBehaviour implements IBehaviour {
         this.exploreTicksLeft = 0;
         TeamScouting.release(this.tag);
         this.logRevisit(state, remembered);
-        return this.stepToward(state, pos, remembered.position);
+        return this.mover.step(state, pos, remembered.position);
       }
 
       return this.explore(state, pos);
@@ -405,7 +281,7 @@ export class GathererBehaviour implements IBehaviour {
     pos: MessageProtocol.Position,
   ): MessageProtocol.ActionBase | null {
     // Blocked or leg finished: pick a fresh heading.
-    if (this.moveRefused) {
+    if (this.mover.lastMoveRefused) {
       this.exploreTicksLeft = 0;
     }
 
@@ -419,7 +295,7 @@ export class GathererBehaviour implements IBehaviour {
     TeamScouting.reserve(this.tag, this.exploreDirection, state.CurrentTick);
 
     const vector = DIRECTION_VECTORS[this.exploreDirection];
-    return this.stepToward(
+    return this.mover.step(
       state,
       pos,
       new MessageProtocol.Position(
@@ -545,7 +421,7 @@ export class GathererBehaviour implements IBehaviour {
     }
 
     if (distance > 1) {
-      return this.stepToward(state, pos, target);
+      return this.mover.step(state, pos, target);
     }
 
     if (!node) {
@@ -616,7 +492,7 @@ export class GathererBehaviour implements IBehaviour {
       // The ship is bigger than one tile and its inside is not walkable, so a
       // candidate tile in the middle is unreachable. If we are wedged and the
       // ship is right there, drop from where we stand instead of walking.
-      if (this.moveRefused && this.nearBase(pos, base)) {
+      if (this.mover.lastMoveRefused && this.nearBase(pos, base)) {
         console.log(
           `[${this.tag}] Blocked at ${pos.X},${pos.Y} next to the ship. Depositing from here ` +
             `instead of walking to ${spot.X},${spot.Y}.`,
@@ -625,7 +501,7 @@ export class GathererBehaviour implements IBehaviour {
         this.depositSpots[this.probeIndex] = spot;
         this.depositTicks = 0;
       } else {
-        return this.stepToward(state, pos, spot);
+        return this.mover.step(state, pos, spot);
       }
     }
 
@@ -801,138 +677,8 @@ export class GathererBehaviour implements IBehaviour {
     return insideRect || (pos.X === base.Position.X && pos.Y === base.Position.Y);
   }
 
-  /**
-   * One tile per tick. Routes around trees, hulls and other bots using the
-   * tiles we can currently see, falling back to a straight X-then-Y step when
-   * no route is found (target out of vision, or we are boxed in).
-   */
-  private stepToward(
-    state: MessageProtocol.GameState,
-    from: MessageProtocol.Position,
-    to: MessageProtocol.Position,
-  ): MessageProtocol.MoveAction {
-    const planned = this.findFirstStep(state, from, to);
-    if (planned) {
-      return this.move(from, planned);
-    }
 
-    const deltaX = to.X - from.X;
-    const deltaY = to.Y - from.Y;
 
-    return this.move(
-      from,
-      deltaX !== 0
-        ? new MessageProtocol.Position(from.X + Math.sign(deltaX), from.Y)
-        : new MessageProtocol.Position(from.X, from.Y + Math.sign(deltaY)),
-    );
-  }
-
-  /**
-   * Breadth-first search over visible tiles, re-run every tick so moving
-   * obstacles (other bots) are handled naturally. Returns the first step of
-   * the route, or of the best partial route when the goal is unreachable.
-   */
-  private findFirstStep(
-    state: MessageProtocol.GameState,
-    from: MessageProtocol.Position,
-    to: MessageProtocol.Position,
-  ): MessageProtocol.Position | null {
-    const startKey = `${from.X},${from.Y}`;
-    const goalKey = `${to.X},${to.Y}`;
-    if (startKey === goalKey) {
-      return null;
-    }
-
-    const positions = new Map<string, MessageProtocol.Position>([[startKey, from]]);
-    const cameFrom = new Map<string, string>();
-    const visited = new Set<string>([startKey]);
-    const queue: MessageProtocol.Position[] = [from];
-
-    let head = 0;
-    let bestKey = startKey;
-    let bestDistance = this.manhattan(from, to);
-
-    while (head < queue.length && head < GathererBehaviour.PATH_MAX_NODES) {
-      const current = queue[head++];
-      const currentKey = `${current.X},${current.Y}`;
-
-      const distance = this.manhattan(current, to);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestKey = currentKey;
-      }
-
-      if (currentKey === goalKey) {
-        bestKey = currentKey;
-        break;
-      }
-
-      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const next = new MessageProtocol.Position(current.X + dx, current.Y + dy);
-        const nextKey = `${next.X},${next.Y}`;
-
-        if (visited.has(nextKey)) {
-          continue;
-        }
-        if (
-          Math.abs(next.X - from.X) > GathererBehaviour.PATH_RADIUS ||
-          Math.abs(next.Y - from.Y) > GathererBehaviour.PATH_RADIUS
-        ) {
-          continue;
-        }
-        if (nextKey !== goalKey && !this.isWalkable(state, next)) {
-          continue;
-        }
-
-        visited.add(nextKey);
-        positions.set(nextKey, next);
-        cameFrom.set(nextKey, currentKey);
-        queue.push(next);
-      }
-    }
-
-    if (bestKey === startKey) {
-      return null;
-    }
-
-    // Walk the parent chain back until the tile whose parent is where we stand.
-    let key = bestKey;
-    while (cameFrom.get(key) !== startKey) {
-      const parent = cameFrom.get(key);
-      if (!parent) {
-        return null;
-      }
-      key = parent;
-    }
-
-    return positions.get(key) ?? null;
-  }
-
-  /**
-   * Trees are resource nodes, so HasResource blocks. Unknown tiles are treated
-   * as open, otherwise the bot could never path outside its own vision.
-   */
-  private isWalkable(
-    state: MessageProtocol.GameState,
-    pos: MessageProtocol.Position,
-  ): boolean {
-    const blockedUntil = this.blockedUntil.get(`${pos.X},${pos.Y}`);
-    if (blockedUntil !== undefined && blockedUntil > state.CurrentTick) {
-      return false;
-    }
-
-    const tile = state.getTileAt(pos);
-    if (!tile) {
-      return true;
-    }
-
-    const category = tile.TerrainCategory.toLowerCase();
-    if (category.includes("liquid") || category.includes("water")) {
-      return false;
-    }
-
-    return !tile.HasResource && !tile.HasStructure && !tile.HasEntity;
-  }
 
   private manhattan(a: MessageProtocol.Position, b: MessageProtocol.Position): number {
     return Math.abs(a.X - b.X) + Math.abs(a.Y - b.Y);
