@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:gitlabbe.github.io)",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}
