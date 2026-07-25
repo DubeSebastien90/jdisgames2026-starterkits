@@ -43,6 +43,9 @@ export class GathererBehaviour implements IBehaviour {
   private static readonly EMPTY_LOG_EVERY = 20;
   // How long a node that refused to yield is skipped over.
   private static readonly NODE_IGNORE_TTL = 60;
+  // Assumed respawn time when the server did not give us a RemainingTicks to
+  // go on. Sugarcane is 180s in the docs, so this is deliberately cautious.
+  private static readonly RESPAWN_GUESS = 200;
   // DEBUG: ignore the seek/gather/return logic below and just send
   // DepositToBase every tick, wherever we stand. Set back to false for play.
   private static readonly FORCE_DEPOSIT = false;
@@ -82,6 +85,18 @@ export class GathererBehaviour implements IBehaviour {
   private exploreDirection: Direction | null = null;
   private exploreTicksLeft = 0;
   private exploreCount = 0;
+  private lastRevisitKey: string | null = null;
+  /** Every node we have ever seen, so respawns out of vision are not lost. */
+  private readonly knownNodes = new Map<
+    number,
+    {
+      name: string;
+      position: MessageProtocol.Position;
+      amount: number;
+      respawnTicks: number;
+      seenTick: number;
+    }
+  >();
 
   public getNextAction(
     state: MessageProtocol.GameState,
@@ -92,6 +107,7 @@ export class GathererBehaviour implements IBehaviour {
 
     // Both bots log to the same console, so stamp every line with which one.
     this.tag = state.Bot.BotType || "bot";
+    this.rememberVisibleNodes(state);
 
     const pos = state.Bot.Position;
     const carried = this.carriedCount(state.Bot.Inventory);
@@ -278,6 +294,18 @@ export class GathererBehaviour implements IBehaviour {
       if (empty) {
         this.logEmptyNodes(state, pos, empty);
       }
+
+      // Before wandering off, check the nodes we have seen before. One we
+      // emptied ages ago has had time to respawn, and we know where it is.
+      const remembered = this.bestRememberedNode(state, pos);
+      if (remembered) {
+        this.exploreDirection = null;
+        this.exploreTicksLeft = 0;
+        TeamScouting.release(this.tag);
+        this.logRevisit(state, remembered);
+        return this.stepToward(state, pos, remembered.position);
+      }
+
       return this.explore(state, pos);
     }
 
@@ -293,6 +321,78 @@ export class GathererBehaviour implements IBehaviour {
     console.log(`[${this.tag}] Targeting ${node.Name} at ${node.Position.X},${node.Position.Y}`);
 
     return this.gather(state, pos, this.carriedCount(state.Bot?.Inventory ?? []));
+  }
+
+  /** Record everything in sight, so we can come back after a respawn. */
+  private rememberVisibleNodes(state: MessageProtocol.GameState): void {
+    for (const resource of state.VisibleResources) {
+      this.knownNodes.set(resource.Id, {
+        name: resource.Name,
+        position: resource.Position,
+        amount: resource.CurrentAmount,
+        respawnTicks: resource.RemainingTicks,
+        seenTick: state.CurrentTick,
+      });
+    }
+  }
+
+  /**
+   * Nearest node we remember that should be worth the walk: either it had
+   * stock when we left it, or it was empty long enough ago that its respawn
+   * timer has run out. Nodes we can currently see are skipped, since the
+   * caller has already established none of those are worth mining.
+   */
+  private bestRememberedNode(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): { name: string; position: MessageProtocol.Position } | null {
+    const visible = new Set(state.VisibleResources.map((r) => r.Id));
+    let best: { name: string; position: MessageProtocol.Position } | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const [id, node] of this.knownNodes) {
+      if (visible.has(id)) {
+        continue;
+      }
+
+      const ignoredUntil = this.ignoredNodes.get(id);
+      if (ignoredUntil !== undefined && ignoredUntil > state.CurrentTick) {
+        continue;
+      }
+      if (TeamClaims.takenByOther(id, this.tag, state.CurrentTick)) {
+        continue;
+      }
+
+      // RemainingTicks is what the server told us at the time we looked.
+      const age = state.CurrentTick - node.seenTick;
+      const wait = node.respawnTicks > 0 ? node.respawnTicks : GathererBehaviour.RESPAWN_GUESS;
+      if (node.amount <= 0 && age < wait) {
+        continue;
+      }
+
+      const distance = this.manhattan(pos, node.position);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = { name: node.name, position: node.position };
+      }
+    }
+
+    return best;
+  }
+
+  private logRevisit(
+    state: MessageProtocol.GameState,
+    node: { name: string; position: MessageProtocol.Position },
+  ): void {
+    const key = `${node.position.X},${node.position.Y}`;
+    if (this.lastRevisitKey === key) {
+      return;
+    }
+    this.lastRevisitKey = key;
+    console.log(
+      `[${this.tag}] Nothing in sight; heading back to the ${node.name} at ` +
+        `${node.position.X},${node.position.Y} (should have respawned).`,
+    );
   }
 
   /**
