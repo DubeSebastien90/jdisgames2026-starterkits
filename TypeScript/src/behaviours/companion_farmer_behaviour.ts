@@ -30,6 +30,9 @@ export class CompanionFarmerBehaviour implements IBehaviour {
   // Touching the hull is close enough to withdraw: base actions have been seen
   // to succeed from a tile just outside it, and the inside is not walkable.
   private static readonly WITHDRAW_RANGE = 1;
+  // Withdraw requests that changed nothing before we accept it is not working
+  // from here. Without this a refused withdraw is silent and repeats for ever.
+  private static readonly WITHDRAW_TRIES = 5;
 
   /** Shared navigation: routes around trees, hulls and other bots. */
   private readonly mover: IMover = new PathfindingMover();
@@ -38,6 +41,10 @@ export class CompanionFarmerBehaviour implements IBehaviour {
   private tag = "bot";
   private withdrawPlan: SpotPlan | null = null;
   private standbyPlan: SpotPlan | null = null;
+  private withdrawTries = 0;
+  private lastCarried = 0;
+  /** Set once a full-stack request has been refused, see doWithdraw. */
+  private oneAtATime = false;
 
   public getNextAction(state: MessageProtocol.GameState): MessageProtocol.ActionBase | null {
     if (!state.Bot || !state.Base || !state.Team) {
@@ -84,19 +91,78 @@ export class CompanionFarmerBehaviour implements IBehaviour {
       return this.mover.step(state, pos, this.target(state, this.withdrawPlan!));
     }
 
+    const carried = this.carriedCount(bot);
     const freeSlots = bot.Slots > 0 ? bot.Slots - bot.Inventory.length : 10 - bot.Inventory.length;
 
     if (freeSlots <= 0 || base.Inventory.length === 0) {
+      // Anything at all is enough to send a companion, since one carries a
+      // single item by default. Only an empty pack is worth complaining about.
       console.log(
-        `[${this.tag}] Done withdrawing (freeSlots=${freeSlots}, baseItems=${base.Inventory.length}). Moving to standby.`,
+        `[${this.tag}] Done withdrawing ${carried} (freeSlots=${freeSlots}, ` +
+          `baseItems=${base.Inventory.length}). Moving to standby.`,
       );
       this.phase = "move";
       return null;
     }
 
+    // Something landed in the pack, so this tile and this request both work.
+    if (carried > this.lastCarried) {
+      this.withdrawTries = 0;
+    }
+    this.lastCarried = carried;
+
+    if (++this.withdrawTries > CompanionFarmerBehaviour.WITHDRAW_TRIES) {
+      this.withdrawTries = 0;
+      this.logWithdrawDiagnostic(state, pos, base, bot, carried);
+
+      if (!this.oneAtATime) {
+        // A request for more than fits is a plausible refusal, so drop to a
+        // single item before blaming where we are standing.
+        console.log(`[${this.tag}] Retrying one item at a time.`);
+        this.oneAtATime = true;
+      } else {
+        // Still nothing: we are probably not as "at base" as we think.
+        const plan = this.withdrawPlan!;
+        plan.index = (plan.index + 1) % plan.spots.length;
+        console.log(`[${this.tag}] Moving onto ${this.describe(plan)} and trying again.`);
+        return this.mover.step(state, pos, this.target(state, plan));
+      }
+    }
+
     const item = base.Inventory[0];
-    console.log(`[${this.tag}] Withdrawing ${item.ItemName} x${item.Quantity} from base.`);
-    return new MessageProtocol.WithdrawFromBaseAction(item.ItemName, item.Quantity);
+    const quantity = this.oneAtATime ? 1 : item.Quantity;
+    console.log(`[${this.tag}] Withdrawing ${item.ItemName} x${quantity} from base.`);
+    return new MessageProtocol.WithdrawFromBaseAction(item.ItemName, quantity);
+  }
+
+  /** Why nothing is coming out of storage. Mirrors the gatherer's deposit dump. */
+  private logWithdrawDiagnostic(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+    base: MessageProtocol.BaseInfo,
+    bot: MessageProtocol.PlayerInfo,
+    carried: number,
+  ): void {
+    const tile = state.getTileAt(pos);
+    const storage = base.Inventory.slice(0, 6)
+      .map((s) => `${s.ItemName}x${s.Quantity}`)
+      .join(", ");
+
+    console.log(`=== [${this.tag}] withdraw diagnostic ===`);
+    console.log(`  bot at        : ${pos.X},${pos.Y}  (aiming for ${this.describe(this.withdrawPlan!)})`);
+    console.log(`  base.Position : ${base.Position.X},${base.Position.Y} ${base.Width}x${base.Height}`);
+    console.log(`  distanceTo    : ${BaseGeometry.distanceTo(base, pos)} (inside=${BaseGeometry.contains(base, pos)})`);
+    console.log(`  carrying      : ${carried} in ${bot.Inventory.length}/${bot.Slots} slots`);
+    console.log(`  base storage  : ${base.Inventory.length}/${base.StorageSlots} stacks [${storage}]`);
+    console.log(
+      `  tile here     : ${tile ? `${tile.Terrain}/${tile.Zone} owner=${tile.ZoneOwnerTeamId}` : "NOT VISIBLE"}`,
+    );
+    console.log("  -> check the [SERVER] Error lines above for the refusal reason.");
+    console.log("======================================");
+  }
+
+  private carriedCount(bot: MessageProtocol.PlayerInfo): number {
+    return bot.Inventory.reduce((total, stack) => total + stack.Quantity, 0);
   }
 
   // ─── Phase: move ────────────────────────────────────────────────────────────
@@ -139,11 +205,13 @@ export class CompanionFarmerBehaviour implements IBehaviour {
     bot: MessageProtocol.PlayerInfo,
     team: MessageProtocol.TeamInfo,
   ): MessageProtocol.ActionBase | null {
-    const carried = bot.Inventory.reduce((sum, s) => sum + s.Quantity, 0);
+    const carried = this.carriedCount(bot);
 
     if (carried === 0) {
       console.log(`[${this.tag}] Inventory empty, heading back to base.`);
       this.phase = "withdraw";
+      this.withdrawTries = 0;
+      this.lastCarried = 0;
       return null;
     }
 

@@ -23,7 +23,7 @@ type BehaviourFactory = () => IBehaviour;
  */
 export class TeamController {
   private static readonly ROSTER: Record<string, BehaviourFactory> = {
-    BotA: () => new GathererBehaviour(),
+    BotA: () => new CompanionFarmerBehaviour(),
     BotB: () => new CompanionFarmerBehaviour(),
   };
 
