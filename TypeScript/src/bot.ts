@@ -18,6 +18,14 @@ export class Bot implements IBot {
   // DEBUG: every bot ignores the seek/gather/return logic below and just sends
   // DepositToBase every tick, wherever it stands. Set back to false for play.
   private static readonly FORCE_DEPOSIT = false;
+  // Master switch for the sidestep-when-blocked behaviour below. Off for now:
+  // the code stays put, it just never runs. Flip to true to re-enable.
+  private static readonly USE_DETOUR = false;
+  // Sidestep this many tiles when a move gets refused (usually a resource node
+  // sitting in the way), then go back to normal navigation.
+  private static readonly DETOUR_STEPS = 5;
+  // Each repeated failure sidesteps another DETOUR_STEPS tiles, up to this many.
+  private static readonly MAX_DETOUR_ATTEMPTS = 4;
 
   private phase: Phase = "seek";
   private targetId: number | null = null;
@@ -28,6 +36,14 @@ export class Bot implements IBot {
   private depositSpots: MessageProtocol.Position[] | null = null;
   private probeIndex = 0;
   private depositTicks = 0;
+  private posBeforeMove: MessageProtocol.Position | null = null;
+  private lastMoveTarget: MessageProtocol.Position | null = null;
+  private detourRemaining = 0;
+  private detourDelta: { x: number; y: number } | null = null;
+  private detourSide = 1;
+  private detourAttempts = 0;
+  private depositLocked = false;
+  private lastDepositCarried: number | null = null;
 
   public getNextAction(
     state: MessageProtocol.GameState,
@@ -41,6 +57,19 @@ export class Bot implements IBot {
 
     if (Bot.FORCE_DEPOSIT) {
       return this.forceDeposit(state, pos, carried);
+    }
+
+    // Did last tick's move actually happen? Starts a detour if not.
+    if (Bot.USE_DETOUR) {
+      this.checkIfStuck(pos);
+    }
+
+    // A detour in progress outranks everything else until it finishes.
+    if (Bot.USE_DETOUR && this.detourRemaining > 0 && this.detourDelta) {
+      this.detourRemaining--;
+      const side = this.detourDelta;
+      console.log(`[BOT] Detour step, ${this.detourRemaining} left.`);
+      return this.move(pos, new MessageProtocol.Position(pos.X + side.x, pos.Y + side.y));
     }
 
     // Checked in every phase, so a bot that starts (or restarts) already
@@ -59,6 +88,63 @@ export class Bot implements IBot {
     }
 
     return this.returnToBase(state, pos, carried);
+  }
+
+  /**
+   * If the move we asked for last tick left us on the same tile, something is
+   * in the way (usually a resource node). Sidestep perpendicular to whatever
+   * direction we were trying to go.
+   */
+  private checkIfStuck(pos: MessageProtocol.Position): void {
+    const from = this.posBeforeMove;
+    const to = this.lastMoveTarget;
+    this.posBeforeMove = null;
+    this.lastMoveTarget = null;
+
+    if (!from || !to) {
+      return;
+    }
+
+    if (pos.X !== from.X || pos.Y !== from.Y) {
+      // Moving normally again, so the obstacle is behind us.
+      if (this.detourRemaining === 0) {
+        this.detourAttempts = 0;
+      }
+      return;
+    }
+
+    // Wedged during the sidestep itself: back out the other way.
+    if (this.detourRemaining > 0 && this.detourDelta) {
+      this.detourDelta = { x: -this.detourDelta.x, y: -this.detourDelta.y };
+      this.detourRemaining = Bot.DETOUR_STEPS;
+      console.log("[BOT] Sidestep blocked too, reversing.");
+      return;
+    }
+
+    // Blocked again right after a detour means the obstacle is longer than we
+    // thought, so keep going the same way and reach further each time.
+    this.detourAttempts = Math.min(this.detourAttempts + 1, Bot.MAX_DETOUR_ATTEMPTS);
+
+    const wasHorizontal = to.X !== from.X;
+    this.detourDelta = wasHorizontal
+      ? { x: 0, y: this.detourSide }
+      : { x: this.detourSide, y: 0 };
+    this.detourRemaining = Bot.DETOUR_STEPS * this.detourAttempts;
+
+    console.log(
+      `[BOT] Move to ${to.X},${to.Y} refused. Sidestepping ${this.detourRemaining} ` +
+        `tiles (${this.detourDelta.x},${this.detourDelta.y}).`,
+    );
+  }
+
+  /** Every move goes through here so we can tell next tick whether it worked. */
+  private move(
+    from: MessageProtocol.Position,
+    to: MessageProtocol.Position,
+  ): MessageProtocol.MoveAction {
+    this.posBeforeMove = from;
+    this.lastMoveTarget = to;
+    return new MessageProtocol.MoveAction(to);
   }
 
   /**
@@ -98,9 +184,7 @@ export class Bot implements IBot {
   ): MessageProtocol.ActionBase | null {
     const node = this.nearestResource(pos, state.VisibleResources);
     if (!node) {
-      return new MessageProtocol.MoveAction(
-        new MessageProtocol.Position(pos.X - 1, pos.Y),
-      );
+      return this.move(pos, new MessageProtocol.Position(pos.X - 1, pos.Y));
     }
 
     this.targetId = node.Id;
@@ -174,6 +258,8 @@ export class Bot implements IBot {
       this.depositSpots = null;
       this.probeIndex = 0;
       this.depositTicks = 0;
+      this.depositLocked = false;
+      this.lastDepositCarried = null;
       return this.seek(state, pos);
     }
 
@@ -196,18 +282,33 @@ export class Bot implements IBot {
       this.logDepositDiagnostic(state, pos, base, carried, spot);
     }
 
-    // Deposit refused here: walk to the next candidate base tile.
+    // The pack got lighter, so this tile works even if it only takes one stack
+    // per action. Stay put and keep unloading instead of probing elsewhere.
+    if (this.lastDepositCarried !== null && carried < this.lastDepositCarried) {
+      if (!this.depositLocked) {
+        console.log(`[BOT] Deposit accepted at ${spot.X},${spot.Y}, staying until empty.`);
+        this.depositLocked = true;
+      }
+      this.depositTicks = 1;
+    }
+    this.lastDepositCarried = carried;
+
+    if (this.depositLocked) {
+      return new MessageProtocol.DepositToBaseAction();
+    }
+
+    // Deposit refused here: cycle to the next candidate base tile. Wraps round
+    // rather than jamming on the last one, so a tile is never given up on.
     if (++this.depositTicks > Bot.DEPOSIT_TRIES) {
       this.depositTicks = 0;
-      if (this.probeIndex + 1 < this.depositSpots.length) {
-        this.probeIndex++;
-        const next = this.depositSpots[this.probeIndex];
-        console.log(
-          `[BOT] Deposit refused at ${spot.X},${spot.Y}. Trying ${next.X},${next.Y} ` +
-            `(${this.probeIndex + 1}/${this.depositSpots.length}).`,
-        );
-      } else {
-        console.log("[BOT] Every base tile refused the deposit. Check [SERVER] Error lines above.");
+      this.probeIndex = (this.probeIndex + 1) % this.depositSpots.length;
+      const next = this.depositSpots[this.probeIndex];
+      console.log(
+        `[BOT] Deposit refused at ${spot.X},${spot.Y}. Trying ${next.X},${next.Y} ` +
+          `(${this.probeIndex + 1}/${this.depositSpots.length}).`,
+      );
+      if (this.probeIndex === 0) {
+        console.log("[BOT] Every base tile refused so far. Check [SERVER] Error lines above.");
       }
       return null;
     }
@@ -289,6 +390,8 @@ export class Bot implements IBot {
     this.targetPosition = null;
     this.standOnNode = false;
     this.idleTicks = 0;
+    this.depositLocked = false;
+    this.lastDepositCarried = null;
     return this.returnToBase(state, pos, carried);
   }
 
@@ -324,7 +427,8 @@ export class Bot implements IBot {
     const deltaX = to.X - from.X;
     const deltaY = to.Y - from.Y;
 
-    return new MessageProtocol.MoveAction(
+    return this.move(
+      from,
       deltaX !== 0
         ? new MessageProtocol.Position(from.X + Math.sign(deltaX), from.Y)
         : new MessageProtocol.Position(from.X, from.Y + Math.sign(deltaY)),
