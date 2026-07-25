@@ -6,6 +6,11 @@ import { PumpPlacerBehaviour } from "../behaviours/pump_placer_behaviour";
 import { ReturnToBaseBehaviour } from "../behaviours/return_to_base_behaviour";
 import { PlaceRadarBehaviour } from "../behaviours/place_radar_behaviour";
 // import { ScoutBehaviour } from "../behaviours/scout_behaviour";
+// Straight-line probes, for looking at what is in one direction:
+// import { GoLeftBehaviour } from "../behaviours/go_left_behaviour";
+// import { GoRightBehaviour } from "../behaviours/go_right_behaviour";
+// import { GoUpBehaviour } from "../behaviours/go_up_behaviour";
+// import { GoDownBehaviour } from "../behaviours/go_down_behaviour";
 
 type BehaviourFactory = () => IBehaviour;
 
