@@ -9,6 +9,7 @@ import {
   Direction,
   TeamScouting,
 } from "../team/team_scouting";
+import { BaseGeometry } from "../world/base_geometry";
 
 type Phase = "seek" | "gather" | "return";
 
@@ -147,7 +148,7 @@ export class GathererBehaviour implements IBehaviour {
       `[${this.tag}/FORCE] tick=${state.CurrentTick} at ${pos.X},${pos.Y} carrying ${carried} (${inventory}) | ` +
         `base=${base ? `${base.Position.X},${base.Position.Y} ${base.Width}x${base.Height}` : "NULL"} | ` +
         `tile=${tile ? `${tile.Terrain}/${tile.Zone} owner=${tile.ZoneOwnerTeamId}` : "NOT VISIBLE"} | ` +
-        `atBase=${base ? this.atBase(state, pos, base) : "n/a"}`,
+        `atBase=${base ? BaseGeometry.isAtBase(state, pos, base) : "n/a"}`,
     );
 
     return new MessageProtocol.DepositToBaseAction();
@@ -484,7 +485,7 @@ export class GathererBehaviour implements IBehaviour {
     }
 
     if (!this.depositSpots) {
-      this.depositSpots = this.candidateDepositSpots(base);
+      this.depositSpots = BaseGeometry.interiorTiles(base);
     }
 
     let spot = this.depositSpots[this.probeIndex];
@@ -492,7 +493,10 @@ export class GathererBehaviour implements IBehaviour {
       // The ship is bigger than one tile and its inside is not walkable, so a
       // candidate tile in the middle is unreachable. If we are wedged and the
       // ship is right there, drop from where we stand instead of walking.
-      if (this.mover.lastMoveRefused && this.nearBase(pos, base)) {
+      if (
+        this.mover.lastMoveRefused &&
+        BaseGeometry.distanceTo(base, pos) <= GathererBehaviour.NEAR_BASE_RANGE
+      ) {
         console.log(
           `[${this.tag}] Blocked at ${pos.X},${pos.Y} next to the ship. Depositing from here ` +
             `instead of walking to ${spot.X},${spot.Y}.`,
@@ -545,71 +549,6 @@ export class GathererBehaviour implements IBehaviour {
     return new MessageProtocol.DepositToBaseAction();
   }
 
-  /**
-   * Are we touching the ship? Measured against the base rectangle read both as
-   * top-left anchored and as centre anchored, since we do not know which it is.
-   */
-  private nearBase(
-    pos: MessageProtocol.Position,
-    base: MessageProtocol.BaseInfo,
-  ): boolean {
-    const width = Math.max(base.Width, 1);
-    const height = Math.max(base.Height, 1);
-
-    const distanceToRect = (originX: number, originY: number): number => {
-      const dx = Math.max(originX - pos.X, 0, pos.X - (originX + width - 1));
-      const dy = Math.max(originY - pos.Y, 0, pos.Y - (originY + height - 1));
-      return Math.max(dx, dy);
-    };
-
-    const distance = Math.min(
-      distanceToRect(base.Position.X, base.Position.Y),
-      distanceToRect(
-        base.Position.X - Math.floor(width / 2),
-        base.Position.Y - Math.floor(height / 2),
-      ),
-    );
-
-    return distance <= GathererBehaviour.NEAR_BASE_RANGE;
-  }
-
-  /**
-   * We do not know whether BaseInfo.Position is the corner or the centre of
-   * the base, nor which tile accepts a deposit, so build every plausible tile
-   * and probe them in order.
-   */
-  private candidateDepositSpots(
-    base: MessageProtocol.BaseInfo,
-  ): MessageProtocol.Position[] {
-    const width = Math.max(base.Width, 1);
-    const height = Math.max(base.Height, 1);
-    const seen = new Set<string>();
-    const spots: MessageProtocol.Position[] = [];
-
-    const push = (x: number, y: number): void => {
-      const key = `${x},${y}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        spots.push(new MessageProtocol.Position(x, y));
-      }
-    };
-
-    push(base.Position.X, base.Position.Y);
-
-    // Rectangle read as top-left anchored, then as centre anchored.
-    for (const originX of [base.Position.X, base.Position.X - Math.floor(width / 2)]) {
-      for (const originY of [base.Position.Y, base.Position.Y - Math.floor(height / 2)]) {
-        for (let y = 0; y < height; y++) {
-          for (let x = 0; x < width; x++) {
-            push(originX + x, originY + y);
-          }
-        }
-      }
-    }
-
-    return spots;
-  }
-
   private logDepositDiagnostic(
     state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
@@ -633,7 +572,7 @@ export class GathererBehaviour implements IBehaviour {
       `  tile here     : ${tile ? `${tile.Terrain}/${tile.Zone} owner=${tile.ZoneOwnerTeamId} structure=${tile.HasStructure}` : "NOT VISIBLE"}`,
     );
     console.log(`  structures<=3 : ${nearby.length ? nearby.join(", ") : "none"}`);
-    console.log(`  atBase()      : ${this.atBase(state, pos, base)}`);
+    console.log(`  atBase()      : ${BaseGeometry.isAtBase(state, pos, base)}`);
     console.log("================================");
   }
 
@@ -652,33 +591,6 @@ export class GathererBehaviour implements IBehaviour {
     this.lastDepositCarried = null;
     return this.returnToBase(state, pos, carried);
   }
-
-  /**
-   * BaseInfo.Position could be the corner or the centre of the base rectangle,
-   * so accept any of: our tile is a base zone we own, we are inside the
-   * rectangle read as top-left, or we are exactly on Position.
-   */
-  private atBase(
-    state: MessageProtocol.GameState,
-    pos: MessageProtocol.Position,
-    base: MessageProtocol.BaseInfo,
-  ): boolean {
-    const tile = state.getTileAt(pos);
-    if (tile && tile.Zone.toLowerCase().includes("base")) {
-      return tile.ZoneOwnerTeamId === null || tile.ZoneOwnerTeamId === state.Team?.Id;
-    }
-
-    const insideRect =
-      pos.X >= base.Position.X &&
-      pos.X < base.Position.X + Math.max(base.Width, 1) &&
-      pos.Y >= base.Position.Y &&
-      pos.Y < base.Position.Y + Math.max(base.Height, 1);
-
-    return insideRect || (pos.X === base.Position.X && pos.Y === base.Position.Y);
-  }
-
-
-
 
   private manhattan(a: MessageProtocol.Position, b: MessageProtocol.Position): number {
     return Math.abs(a.X - b.X) + Math.abs(a.Y - b.Y);

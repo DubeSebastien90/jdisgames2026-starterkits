@@ -1,10 +1,14 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IMover } from "./imover";
+import { TileClaims } from "./tile_claims";
 
 /**
  * Breadth-first search over the tiles we can currently see, re-planned every
  * tick so moving obstacles (other bots) sort themselves out. Remembers tiles
  * that refused us, briefly, so it stops walking into them.
+ *
+ * Every bot gets its own instance, but they coordinate through TileClaims so
+ * teammates route around each other instead of colliding.
  */
 export class PathfindingMover implements IMover {
   public readonly name = "pathfinding";
@@ -17,24 +21,58 @@ export class PathfindingMover implements IMover {
   // Much shorter when the blocker was another bot: it walks away on its own,
   // and avoiding its tile for 30 ticks pushes us into silly detours.
   private static readonly ENTITY_BLOCK_TTL = 3;
+  // Ticks we will stand and wait for a teammate to clear a tile before walking
+  // into it anyway. Two bots facing each other in a one-tile gap would both
+  // wait for the other for good, so the wait has to end somewhere: bumping
+  // gets the tile marked blocked and forces a fresh plan, as it always did.
+  private static readonly MAX_WAIT_TICKS = 3;
 
   private readonly blockedUntil = new Map<string, number>();
   private posBeforeMove: MessageProtocol.Position | null = null;
   private lastMoveTarget: MessageProtocol.Position | null = null;
   private refused = false;
+  /** Who we are claiming tiles as. Read from the state, so nothing to plumb. */
+  private owner = "bot";
+  private waitTicks = 0;
 
   public get lastMoveRefused(): boolean {
     return this.refused;
   }
 
   /**
+   * Is this a tile a bot could stand on? Public so behaviours can vet a
+   * destination before walking to it without knowing how paths are planned.
+   * A missing tile is one we cannot see, and unseen tiles are assumed open.
+   */
+  public static isPassable(tile: MessageProtocol.Tile | null | undefined): boolean {
+    if (!tile) {
+      return true;
+    }
+
+    const category = tile.TerrainCategory.toLowerCase();
+    if (category.includes("liquid") || category.includes("water")) {
+      return false;
+    }
+
+    // Trees are resource nodes, so HasResource blocks.
+    return !tile.HasResource && !tile.HasStructure;
+  }
+
+  /**
    * Compare where we are against the move we asked for last tick. A tile we
    * failed to enter is remembered so the next path plans around it.
+   *
+   * Also where we tell the team which tile we are on. That happens here rather
+   * than in step() because a behaviour that decides to stand still never calls
+   * step(), and a parked bot still needs to be an obstacle to its teammate.
    */
   public observe(
     state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
   ): void {
+    this.owner = state.Bot?.BotType || this.owner;
+    TileClaims.hold(this.owner, pos, state.CurrentTick);
+
     const from = this.posBeforeMove;
     const to = this.lastMoveTarget;
     this.posBeforeMove = null;
@@ -69,15 +107,25 @@ export class PathfindingMover implements IMover {
       return null;
     }
 
-    const planned = this.findFirstStep(state, from, to);
+    // A teammate's tile is avoided when there is another way round.
+    const planned = this.findFirstStep(state, from, to, true);
     if (planned) {
-      return this.move(from, planned);
+      return this.move(state, from, planned);
+    }
+
+    // No way round, so plan through them instead: a bot queued behind its
+    // teammate in a corridor has to be allowed to path over the tile it is
+    // waiting on, or it would sit there for good.
+    const shared = this.findFirstStep(state, from, to, false);
+    if (shared) {
+      return this.stepOrWait(state, from, shared);
     }
 
     const deltaX = to.X - from.X;
     const deltaY = to.Y - from.Y;
 
-    return this.move(
+    return this.stepOrWait(
+      state,
       from,
       deltaX !== 0
         ? new MessageProtocol.Position(from.X + Math.sign(deltaX), from.Y)
@@ -85,11 +133,35 @@ export class PathfindingMover implements IMover {
     );
   }
 
+  /**
+   * Take the step unless a teammate is in the way. Waiting a tick costs nothing
+   * when the alternative is a move the server would refuse anyway — but only
+   * for so long, see MAX_WAIT_TICKS.
+   */
+  private stepOrWait(
+    state: MessageProtocol.GameState,
+    from: MessageProtocol.Position,
+    to: MessageProtocol.Position,
+  ): MessageProtocol.MoveAction | null {
+    if (
+      this.waitTicks < PathfindingMover.MAX_WAIT_TICKS &&
+      TileClaims.takenByOther(this.owner, to, state.CurrentTick)
+    ) {
+      this.waitTicks++;
+      return null;
+    }
+
+    return this.move(state, from, to);
+  }
+
   /** Every move goes through here so observe() can tell whether it worked. */
   private move(
+    state: MessageProtocol.GameState,
     from: MessageProtocol.Position,
     to: MessageProtocol.Position,
   ): MessageProtocol.MoveAction {
+    TileClaims.reserve(this.owner, to, state.CurrentTick);
+    this.waitTicks = 0;
     this.posBeforeMove = from;
     this.lastMoveTarget = to;
     return new MessageProtocol.MoveAction(to);
@@ -98,11 +170,15 @@ export class PathfindingMover implements IMover {
   /**
    * Returns the first step of the route, or of the best partial route when the
    * goal cannot be reached from what we can see.
+   *
+   * @param respectClaims treat tiles a teammate holds as blocked. The caller
+   * retries without it when that leaves no route at all.
    */
   private findFirstStep(
     state: MessageProtocol.GameState,
     from: MessageProtocol.Position,
     to: MessageProtocol.Position,
+    respectClaims: boolean,
   ): MessageProtocol.Position | null {
     const startKey = `${from.X},${from.Y}`;
     const goalKey = `${to.X},${to.Y}`;
@@ -144,7 +220,7 @@ export class PathfindingMover implements IMover {
         ) {
           continue;
         }
-        if (nextKey !== goalKey && !this.isWalkable(state, next)) {
+        if (nextKey !== goalKey && !this.isWalkable(state, next, respectClaims)) {
           continue;
         }
 
@@ -173,15 +249,20 @@ export class PathfindingMover implements IMover {
   }
 
   /**
-   * Trees are resource nodes, so HasResource blocks. Unknown tiles are treated
-   * as open, otherwise the bot could never path outside its own vision.
+   * Terrain, then anything standing on it. Unknown tiles are treated as open,
+   * otherwise the bot could never path outside its own vision.
    */
   private isWalkable(
     state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
+    respectClaims: boolean,
   ): boolean {
     const blockedUntil = this.blockedUntil.get(`${pos.X},${pos.Y}`);
     if (blockedUntil !== undefined && blockedUntil > state.CurrentTick) {
+      return false;
+    }
+
+    if (respectClaims && TileClaims.takenByOther(this.owner, pos, state.CurrentTick)) {
       return false;
     }
 
@@ -190,12 +271,7 @@ export class PathfindingMover implements IMover {
       return true;
     }
 
-    const category = tile.TerrainCategory.toLowerCase();
-    if (category.includes("liquid") || category.includes("water")) {
-      return false;
-    }
-
-    return !tile.HasResource && !tile.HasStructure && !tile.HasEntity;
+    return PathfindingMover.isPassable(tile) && !tile.HasEntity;
   }
 
   private manhattan(
