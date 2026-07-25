@@ -15,6 +15,8 @@ export class Bot implements IBot {
   private static readonly STUCK_TICKS = 5;
   // Deposit attempts on one tile before assuming it is the wrong spot.
   private static readonly DEPOSIT_TRIES = 3;
+  // How far from the ship still counts as "at the ship" when we get wedged.
+  private static readonly NEAR_BASE_RANGE = 2;
   // DEBUG: every bot ignores the seek/gather/return logic below and just sends
   // DepositToBase every tick, wherever it stands. Set back to false for play.
   private static readonly FORCE_DEPOSIT = false;
@@ -44,6 +46,9 @@ export class Bot implements IBot {
   private detourAttempts = 0;
   private depositLocked = false;
   private lastDepositCarried: number | null = null;
+  private moveRefused = false;
+  private refusedFrom: MessageProtocol.Position | null = null;
+  private refusedTo: MessageProtocol.Position | null = null;
 
   public getNextAction(
     state: MessageProtocol.GameState,
@@ -59,9 +64,11 @@ export class Bot implements IBot {
       return this.forceDeposit(state, pos, carried);
     }
 
-    // Did last tick's move actually happen? Starts a detour if not.
+    // Did last tick's move actually happen?
+    this.updateMoveOutcome(pos);
+
     if (Bot.USE_DETOUR) {
-      this.checkIfStuck(pos);
+      this.checkIfStuck();
     }
 
     // A detour in progress outranks everything else until it finishes.
@@ -95,21 +102,10 @@ export class Bot implements IBot {
    * in the way (usually a resource node). Sidestep perpendicular to whatever
    * direction we were trying to go.
    */
-  private checkIfStuck(pos: MessageProtocol.Position): void {
-    const from = this.posBeforeMove;
-    const to = this.lastMoveTarget;
-    this.posBeforeMove = null;
-    this.lastMoveTarget = null;
-
-    if (!from || !to) {
-      return;
-    }
-
-    if (pos.X !== from.X || pos.Y !== from.Y) {
-      // Moving normally again, so the obstacle is behind us.
-      if (this.detourRemaining === 0) {
-        this.detourAttempts = 0;
-      }
+  private checkIfStuck(): void {
+    const from = this.refusedFrom;
+    const to = this.refusedTo;
+    if (!this.moveRefused || !from || !to) {
       return;
     }
 
@@ -135,6 +131,37 @@ export class Bot implements IBot {
       `[BOT] Move to ${to.X},${to.Y} refused. Sidestepping ${this.detourRemaining} ` +
         `tiles (${this.detourDelta.x},${this.detourDelta.y}).`,
     );
+  }
+
+  /**
+   * Compare where we are against the move we asked for last tick. Runs every
+   * tick regardless of USE_DETOUR, because the deposit logic needs to know
+   * when we are wedged too.
+   */
+  private updateMoveOutcome(pos: MessageProtocol.Position): void {
+    const from = this.posBeforeMove;
+    const to = this.lastMoveTarget;
+    this.posBeforeMove = null;
+    this.lastMoveTarget = null;
+    this.moveRefused = false;
+    this.refusedFrom = null;
+    this.refusedTo = null;
+
+    if (!from || !to) {
+      return;
+    }
+
+    if (pos.X === from.X && pos.Y === from.Y) {
+      this.moveRefused = true;
+      this.refusedFrom = from;
+      this.refusedTo = to;
+      return;
+    }
+
+    // Moving normally again, so the obstacle is behind us.
+    if (this.detourRemaining === 0) {
+      this.detourAttempts = 0;
+    }
   }
 
   /** Every move goes through here so we can tell next tick whether it worked. */
@@ -273,9 +300,22 @@ export class Bot implements IBot {
       this.depositSpots = this.candidateDepositSpots(base);
     }
 
-    const spot = this.depositSpots[this.probeIndex];
+    let spot = this.depositSpots[this.probeIndex];
     if (pos.X !== spot.X || pos.Y !== spot.Y) {
-      return this.stepToward(pos, spot);
+      // The ship is bigger than one tile and its inside is not walkable, so a
+      // candidate tile in the middle is unreachable. If we are wedged and the
+      // ship is right there, drop from where we stand instead of walking.
+      if (this.moveRefused && this.nearBase(pos, base)) {
+        console.log(
+          `[BOT] Blocked at ${pos.X},${pos.Y} next to the ship. Depositing from here ` +
+            `instead of walking to ${spot.X},${spot.Y}.`,
+        );
+        spot = new MessageProtocol.Position(pos.X, pos.Y);
+        this.depositSpots[this.probeIndex] = spot;
+        this.depositTicks = 0;
+      } else {
+        return this.stepToward(pos, spot);
+      }
     }
 
     if (this.depositTicks === 0) {
@@ -314,6 +354,34 @@ export class Bot implements IBot {
     }
 
     return new MessageProtocol.DepositToBaseAction();
+  }
+
+  /**
+   * Are we touching the ship? Measured against the base rectangle read both as
+   * top-left anchored and as centre anchored, since we do not know which it is.
+   */
+  private nearBase(
+    pos: MessageProtocol.Position,
+    base: MessageProtocol.BaseInfo,
+  ): boolean {
+    const width = Math.max(base.Width, 1);
+    const height = Math.max(base.Height, 1);
+
+    const distanceToRect = (originX: number, originY: number): number => {
+      const dx = Math.max(originX - pos.X, 0, pos.X - (originX + width - 1));
+      const dy = Math.max(originY - pos.Y, 0, pos.Y - (originY + height - 1));
+      return Math.max(dx, dy);
+    };
+
+    const distance = Math.min(
+      distanceToRect(base.Position.X, base.Position.Y),
+      distanceToRect(
+        base.Position.X - Math.floor(width / 2),
+        base.Position.Y - Math.floor(height / 2),
+      ),
+    );
+
+    return distance <= Bot.NEAR_BASE_RANGE;
   }
 
   /**
