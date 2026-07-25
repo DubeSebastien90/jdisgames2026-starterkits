@@ -25,7 +25,7 @@ type BehaviourFactory = () => IBehaviour;
 export class TeamController {
   private static readonly ROSTER: Record<string, BehaviourFactory> = {
     BotA: () => new GathererBehaviour(),
-    BotB: () => new ExtractorPlacerBehaviour(),
+    BotB: () => new GathererBehaviour(),
   };
 
   /** Used for any bot type not listed above. */
