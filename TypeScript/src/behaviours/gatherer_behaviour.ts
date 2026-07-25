@@ -1,5 +1,6 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
+import { TeamClaims } from "../team/team_claims";
 
 type Phase = "seek" | "gather" | "return";
 
@@ -24,6 +25,9 @@ export class GathererBehaviour implements IBehaviour {
   // A tile that refused us is avoided for this long. Expires because the
   // blocker is often another bot, which will have moved on by then.
   private static readonly BLOCK_TTL = 30;
+  // Much shorter when the blocker was another bot: it walks away on its own,
+  // and avoiding its tile for 30 ticks pushes us into silly detours.
+  private static readonly ENTITY_BLOCK_TTL = 3;
   // How far ahead to aim when wandering left looking for resources.
   private static readonly SEEK_AHEAD = 12;
   // Ticks between "everything is mined out" reports, so waiting is not spammy.
@@ -85,7 +89,7 @@ export class GathererBehaviour implements IBehaviour {
     }
 
     // Did last tick's move actually happen?
-    this.updateMoveOutcome(pos, state.CurrentTick);
+    this.updateMoveOutcome(state, pos);
 
     if (GathererBehaviour.USE_DETOUR) {
       this.checkIfStuck();
@@ -164,7 +168,11 @@ export class GathererBehaviour implements IBehaviour {
    * tick regardless of USE_DETOUR, because the deposit logic needs to know
    * when we are wedged too.
    */
-  private updateMoveOutcome(pos: MessageProtocol.Position, tick: number): void {
+  private updateMoveOutcome(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): void {
+    const tick = state.CurrentTick;
     const from = this.posBeforeMove;
     const to = this.lastMoveTarget;
     this.posBeforeMove = null;
@@ -181,9 +189,15 @@ export class GathererBehaviour implements IBehaviour {
       this.moveRefused = true;
       this.refusedFrom = from;
       this.refusedTo = to;
-      // Remember it so the next path plans around it, but only for a while:
-      // the blocker may well be another bot that is about to walk away.
-      this.blockedUntil.set(`${to.X},${to.Y}`, tick + GathererBehaviour.BLOCK_TTL);
+
+      // Remember it so the next path plans around it. A bot in the way clears
+      // in a couple of ticks, while a tree does not, so do not sulk about a
+      // teammate's tile for as long as we would about scenery.
+      const blocker = state.getTileAt(to);
+      const ttl = blocker?.HasEntity
+        ? GathererBehaviour.ENTITY_BLOCK_TTL
+        : GathererBehaviour.BLOCK_TTL;
+      this.blockedUntil.set(`${to.X},${to.Y}`, tick + ttl);
       return;
     }
 
@@ -265,6 +279,7 @@ export class GathererBehaviour implements IBehaviour {
     this.targetPosition = node.Position;
     this.phase = "gather";
     this.idleTicks = 0;
+    TeamClaims.claim(node.Id, this.tag, state.CurrentTick);
     console.log(`[${this.tag}] Targeting ${node.Name} at ${node.Position.X},${node.Position.Y}`);
 
     return this.gather(state, pos, this.carriedCount(state.Bot?.Inventory ?? []));
@@ -280,6 +295,11 @@ export class GathererBehaviour implements IBehaviour {
     if (!target) {
       this.phase = "seek";
       return this.seek(state, pos);
+    }
+
+    // Keep our reservation alive while we are on the way to it or mining it.
+    if (this.targetId !== null) {
+      TeamClaims.claim(this.targetId, this.tag, state.CurrentTick);
     }
 
     if (carried >= GathererBehaviour.CARRY_TARGET || this.slotsFull(state.Bot)) {
@@ -299,6 +319,7 @@ export class GathererBehaviour implements IBehaviour {
     const node = state.VisibleResources.find((r) => r.Id === this.targetId);
     if (!node || node.CurrentAmount <= 0) {
       console.log(`[${this.tag}] Node depleted.`);
+      this.releaseClaim();
       this.targetId = null;
       this.targetPosition = null;
       this.lastNodeAmount = null;
@@ -323,6 +344,7 @@ export class GathererBehaviour implements IBehaviour {
           "ignoring it and looking elsewhere.",
       );
       this.ignoredNodes.set(node.Id, state.CurrentTick + GathererBehaviour.NODE_IGNORE_TTL);
+      this.releaseClaim();
       this.targetId = null;
       this.targetPosition = null;
       this.lastNodeAmount = null;
@@ -521,6 +543,7 @@ export class GathererBehaviour implements IBehaviour {
     carried: number,
   ): MessageProtocol.ActionBase | null {
     this.phase = "return";
+    this.releaseClaim();
     this.targetId = null;
     this.targetPosition = null;
     this.lastNodeAmount = null;
@@ -711,6 +734,12 @@ export class GathererBehaviour implements IBehaviour {
         continue;
       }
 
+      // Leave nodes our teammate is already working; there is only room for
+      // one bot next to a node and two of us there just block each other.
+      if (TeamClaims.takenByOther(resource.Id, this.tag, tick)) {
+        continue;
+      }
+
       const distance =
         Math.abs(resource.Position.X - from.X) + Math.abs(resource.Position.Y - from.Y);
       if (distance < bestDistance) {
@@ -746,6 +775,12 @@ export class GathererBehaviour implements IBehaviour {
         `Waiting at ${pos.X},${pos.Y} for ${waitingOn.Name} at ` +
         `${waitingOn.Position.X},${waitingOn.Position.Y}. [${summary}]`,
     );
+  }
+
+  private releaseClaim(): void {
+    if (this.targetId !== null) {
+      TeamClaims.release(this.targetId, this.tag);
+    }
   }
 
   private carriedCount(inventory: MessageProtocol.ItemStack[]): number {
