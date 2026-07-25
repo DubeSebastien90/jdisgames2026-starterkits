@@ -114,9 +114,11 @@ export class PathfindingMover implements IMover {
   }
 
   /**
-   * One tile per tick. Falls back to a straight X-then-Y step when no route is
-   * found (target out of vision, or we are boxed in), so it never does worse
-   * than walking blindly.
+   * One tile per tick. Falls back to a straight step toward the target when no
+   * route is found (target out of vision, or we are boxed in), so it never does
+   * worse than walking blindly. Returns null when even that is walled off by
+   * terrain, because a move the server refuses every tick is worse than waiting
+   * for a teammate to open a way through.
    */
   public step(
     state: MessageProtocol.GameState,
@@ -141,16 +143,53 @@ export class PathfindingMover implements IMover {
       return this.stepOrWait(state, from, shared);
     }
 
+    // Straight at the target, but on whichever axis is not walled off. Taking X
+    // whenever it is non-zero shoves us into a lake to the east for good when
+    // the target is north-east and the way round is north: BFS returns nothing
+    // once we stand on the shore tile closest to the target, and this fallback
+    // is what runs every tick after that.
     const deltaX = to.X - from.X;
     const deltaY = to.Y - from.Y;
+    const candidates: MessageProtocol.Position[] = [];
 
-    return this.stepOrWait(
-      state,
-      from,
-      deltaX !== 0
-        ? new MessageProtocol.Position(from.X + Math.sign(deltaX), from.Y)
-        : new MessageProtocol.Position(from.X, from.Y + Math.sign(deltaY)),
+    if (deltaX !== 0) {
+      candidates.push(new MessageProtocol.Position(from.X + Math.sign(deltaX), from.Y));
+    }
+    if (deltaY !== 0) {
+      candidates.push(new MessageProtocol.Position(from.X, from.Y + Math.sign(deltaY)));
+    }
+
+    // The target itself stays fair game even when impassable, exactly as the
+    // search treats it: behaviours aim at resource nodes they cannot stand on.
+    const open = candidates.find(
+      (candidate) =>
+        (candidate.X === to.X && candidate.Y === to.Y) ||
+        !this.isBlockedByTerrain(state, candidate),
     );
+
+    if (!open) {
+      return null;
+    }
+
+    return this.stepOrWait(state, from, open);
+  }
+
+  /**
+   * Terrain we will never get through, as against a bot that walks away on its
+   * own or a tile that refused us once. The fallback filters on this and nothing
+   * else: bumping a teammate is cheap and gets its tile marked blocked, which
+   * forces a fresh plan, but walking into a lake is refused every tick forever.
+   */
+  private isBlockedByTerrain(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): boolean {
+    if (this.knownLiquid.has(`${pos.X},${pos.Y}`)) {
+      return true;
+    }
+
+    const tile = state.getTileAt(pos);
+    return tile !== undefined && !PathfindingMover.isPassable(tile);
   }
 
   /**

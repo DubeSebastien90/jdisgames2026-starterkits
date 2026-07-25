@@ -9,7 +9,13 @@ import { GoUpBehaviour } from "../behaviours/go_up_behaviour";
 import { GoRightBehaviour } from "../behaviours/go_right_behaviour";
 import { GoDownBehaviour } from "../behaviours/go_down_behaviour";
 import { GoLeftBehaviour } from "../behaviours/go_left_behaviour";
+import { GameState, PlacePumpAction } from "../client/message_protocol";
 // import { ScoutBehaviour } from "../behaviours/scout_behaviour";
+// Picky placers: same job, but only on the resource kind you name.
+//   BotA: () => new ExtractorPlacerOnResourceBehaviour("sugar_cane"),
+//   BotB: () => new PumpPlacerOnResourceBehaviour("maple_syrup"),
+// import { ExtractorPlacerOnResourceBehaviour } from "../behaviours/extractor_placer_on_resource_behaviour";
+// import { PumpPlacerOnResourceBehaviour } from "../behaviours/pump_placer_on_resource_behaviour";
 // Straight-line probes, for looking at what is in one direction:
 // import { GoLeftBehaviour } from "../behaviours/go_left_behaviour";
 // import { GoRightBehaviour } from "../behaviours/go_right_behaviour";
