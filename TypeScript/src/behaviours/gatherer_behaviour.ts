@@ -173,7 +173,13 @@ export class GathererBehaviour implements IBehaviour {
     // the capacity has been researched up. Costs nothing while we are mining
     // anyway, and converges on the real number within a few sends. Skipped once
     // the pack is full, or when we are already walking home with a load.
-    const probeLoad = this.companionCapacity + 1;
+    //
+    // Never probe past a load we would carry home, or the walk-home check below
+    // fires first and we set off on a trip we did not need.
+    const probeLoad = Math.min(
+      this.companionCapacity + 1,
+      GathererBehaviour.CARRY_TARGET,
+    );
     if (
       carried < probeLoad &&
       !this.slotsFull(state.Bot) &&
@@ -214,11 +220,9 @@ export class GathererBehaviour implements IBehaviour {
       return true;
     }
 
-    const load = Math.min(
-      GathererBehaviour.CARRY_TARGET,
-      state.Bot && state.Bot.Slots > 0 ? state.Bot.Slots : GathererBehaviour.CARRY_TARGET,
-    );
-    const sends = load / this.companionCapacity;
+    // CARRY_TARGET is the load we would otherwise walk home, so that is what
+    // the two options are compared over.
+    const sends = GathererBehaviour.CARRY_TARGET / this.companionCapacity;
     const walk = 2 * this.manhattan(pos, base.Position) + 1;
 
     return sends < walk;
