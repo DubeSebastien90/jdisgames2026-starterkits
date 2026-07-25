@@ -1,12 +1,14 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
 
-type Phase = "seek" | "walk" | "place" | "done";
+type Phase = "seek" | "walk" | "place" | "explore";
+
+const LIQUID_NAMES = ["corn syrup", "maple syrup", "vanilla", "soda"];
 
 /**
  * Walk to the nearest liquid resource node that can host a pump (and doesn't
- * already have one), then place a pump on it. Repeats for every eligible
- * node in sight.
+ * already have one), then place a pump on it. When no eligible node is in
+ * sight, pick a cardinal direction and explore until one appears.
  */
 export class PumpPlacerBehaviour implements IBehaviour {
   public readonly name = "pump-placer";
@@ -21,6 +23,16 @@ export class PumpPlacerBehaviour implements IBehaviour {
   private stuckTicks = 0;
   private static readonly STUCK_LIMIT = 15;
 
+  private static readonly EXPLORE_LEG = 20;
+  private static readonly DIRECTIONS: { x: number; y: number }[] = [
+    { x: 0, y: -1 }, // north
+    { x: 1, y: 0 },  // east
+    { x: 0, y: 1 },  // south
+    { x: -1, y: 0 }, // west
+  ];
+  private exploreIndex = 0;
+  private exploreTicksLeft = 0;
+
   public getNextAction(
     state: MessageProtocol.GameState,
   ): MessageProtocol.ActionBase | null {
@@ -34,7 +46,7 @@ export class PumpPlacerBehaviour implements IBehaviour {
     this.markExistingPumps(state);
     this.detectStuck(pos);
 
-    if (this.phase === "seek" || this.phase === "done") {
+    if (this.phase === "seek" || this.phase === "explore") {
       return this.seek(state, pos);
     }
     if (this.phase === "walk") {
@@ -49,11 +61,7 @@ export class PumpPlacerBehaviour implements IBehaviour {
   ): MessageProtocol.ActionBase | null {
     const node = this.findBestNode(state, pos);
     if (!node) {
-      if (this.phase !== "done") {
-        console.log(`[${this.tag}] No liquid node available for a pump.`);
-        this.phase = "done";
-      }
-      return null;
+      return this.explore(pos);
     }
 
     this.targetId = node.Id;
@@ -129,6 +137,32 @@ export class PumpPlacerBehaviour implements IBehaviour {
     }
   }
 
+  private explore(pos: MessageProtocol.Position): MessageProtocol.MoveAction {
+    if (this.phase !== "explore" || this.exploreTicksLeft <= 0 || this.stuckTicks > PumpPlacerBehaviour.STUCK_LIMIT) {
+      if (this.phase === "explore" && this.stuckTicks > PumpPlacerBehaviour.STUCK_LIMIT) {
+        // Blocked in this direction, try the next one.
+        this.exploreIndex = (this.exploreIndex + 1) % PumpPlacerBehaviour.DIRECTIONS.length;
+      }
+      const dir = PumpPlacerBehaviour.DIRECTIONS[this.exploreIndex];
+      const labels = ["north", "east", "south", "west"];
+      console.log(`[${this.tag}] No liquid node in sight, exploring ${labels[this.exploreIndex]}.`);
+      this.phase = "explore";
+      this.exploreTicksLeft = PumpPlacerBehaviour.EXPLORE_LEG;
+      this.stuckTicks = 0;
+    }
+
+    this.exploreTicksLeft--;
+    if (this.exploreTicksLeft <= 0) {
+      this.exploreIndex = (this.exploreIndex + 1) % PumpPlacerBehaviour.DIRECTIONS.length;
+    }
+
+    const dir = PumpPlacerBehaviour.DIRECTIONS[this.exploreIndex];
+    return this.stepToward(
+      pos,
+      new MessageProtocol.Position(pos.X + dir.x * 10, pos.Y + dir.y * 10),
+    );
+  }
+
   private findBestNode(
     state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
@@ -141,6 +175,9 @@ export class PumpPlacerBehaviour implements IBehaviour {
         continue;
       }
       if (!resource.CanHostPump) {
+        continue;
+      }
+      if (!LIQUID_NAMES.includes(resource.Name.toLowerCase())) {
         continue;
       }
 
