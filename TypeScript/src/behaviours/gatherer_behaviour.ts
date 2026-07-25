@@ -1,6 +1,12 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
 import { TeamClaims } from "../team/team_claims";
+import {
+  ALL_DIRECTIONS,
+  DIRECTION_VECTORS,
+  Direction,
+  TeamScouting,
+} from "../team/team_scouting";
 
 type Phase = "seek" | "gather" | "return";
 
@@ -28,8 +34,11 @@ export class GathererBehaviour implements IBehaviour {
   // Much shorter when the blocker was another bot: it walks away on its own,
   // and avoiding its tile for 30 ticks pushes us into silly detours.
   private static readonly ENTITY_BLOCK_TTL = 3;
-  // How far ahead to aim when wandering left looking for resources.
+  // How far ahead to aim when exploring for resources.
   private static readonly SEEK_AHEAD = 12;
+  // Ticks committed to one heading before reconsidering, so the bot actually
+  // covers ground instead of dithering on the spot.
+  private static readonly EXPLORE_LEG = 15;
   // Ticks between "everything is mined out" reports, so waiting is not spammy.
   private static readonly EMPTY_LOG_EVERY = 20;
   // How long a node that refused to yield is skipped over.
@@ -70,6 +79,9 @@ export class GathererBehaviour implements IBehaviour {
   private readonly blockedUntil = new Map<string, number>();
   private lastEmptyLogTick = -GathererBehaviour.EMPTY_LOG_EVERY;
   private readonly ignoredNodes = new Map<number, number>();
+  private exploreDirection: Direction | null = null;
+  private exploreTicksLeft = 0;
+  private exploreCount = 0;
 
   public getNextAction(
     state: MessageProtocol.GameState,
@@ -260,20 +272,18 @@ export class GathererBehaviour implements IBehaviour {
   ): MessageProtocol.ActionBase | null {
     const node = this.nearestResource(pos, state.VisibleResources, true, state.CurrentTick);
     if (!node) {
+      // Nothing worth mining in sight. Respawns take minutes, so go find
+      // another patch instead of standing around waiting for this one.
       const empty = this.nearestResource(pos, state.VisibleResources, false, state.CurrentTick);
       if (empty) {
         this.logEmptyNodes(state, pos, empty);
-        return this.chebyshev(pos, empty.Position) <= 1
-          ? null
-          : this.stepToward(state, pos, empty.Position);
       }
-
-      return this.stepToward(
-        state,
-        pos,
-        new MessageProtocol.Position(pos.X - GathererBehaviour.SEEK_AHEAD, pos.Y),
-      );
+      return this.explore(state, pos);
     }
+
+    this.exploreDirection = null;
+    this.exploreTicksLeft = 0;
+    TeamScouting.release(this.tag);
 
     this.targetId = node.Id;
     this.targetPosition = node.Position;
@@ -283,6 +293,103 @@ export class GathererBehaviour implements IBehaviour {
     console.log(`[${this.tag}] Targeting ${node.Name} at ${node.Position.X},${node.Position.Y}`);
 
     return this.gather(state, pos, this.carriedCount(state.Bot?.Inventory ?? []));
+  }
+
+  /**
+   * Sweep in one of the four directions looking for a fresh patch. Commits to
+   * a heading for a while so it actually covers ground, and avoids whichever
+   * way a teammate is already going.
+   */
+  private explore(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): MessageProtocol.ActionBase | null {
+    // Blocked or leg finished: pick a fresh heading.
+    if (this.moveRefused) {
+      this.exploreTicksLeft = 0;
+    }
+
+    if (!this.exploreDirection || this.exploreTicksLeft <= 0) {
+      this.exploreDirection = this.chooseExploreDirection(state, pos);
+      this.exploreTicksLeft = GathererBehaviour.EXPLORE_LEG;
+      console.log(`[${this.tag}] Nothing to mine here, exploring ${this.exploreDirection}.`);
+    }
+
+    this.exploreTicksLeft--;
+    TeamScouting.reserve(this.tag, this.exploreDirection, state.CurrentTick);
+
+    const vector = DIRECTION_VECTORS[this.exploreDirection];
+    return this.stepToward(
+      state,
+      pos,
+      new MessageProtocol.Position(
+        pos.X + vector.x * GathererBehaviour.SEEK_AHEAD,
+        pos.Y + vector.y * GathererBehaviour.SEEK_AHEAD,
+      ),
+    );
+  }
+
+  /**
+   * Prefer a direction that no teammate has reserved and that does not point
+   * at an ally we can see, so the team fans out instead of clumping. Filters
+   * are relaxed one at a time rather than ever returning nothing.
+   */
+  private chooseExploreDirection(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): Direction {
+    const taken = TeamScouting.taken(this.tag, state.CurrentTick);
+    const towardAlly = new Set<Direction>();
+
+    for (const ally of this.visibleAllies(state)) {
+      towardAlly.add(this.dominantDirection(pos, ally));
+    }
+
+    const free = ALL_DIRECTIONS.filter((d) => !taken.has(d) && !towardAlly.has(d));
+    const options =
+      free.filter((d) => d !== this.exploreDirection).length > 0
+        ? free.filter((d) => d !== this.exploreDirection)
+        : free.length > 0
+          ? free
+          : ALL_DIRECTIONS.filter((d) => !taken.has(d));
+
+    const candidates = options.length > 0 ? options : ALL_DIRECTIONS;
+
+    // Rotate so a bot that keeps exploring does not pick the same way twice,
+    // and so two bots with identical inputs still stagger.
+    const seed = [...this.tag].reduce((total, ch) => total + ch.charCodeAt(0), 0);
+    return candidates[(this.exploreCount++ + seed) % candidates.length];
+  }
+
+  private visibleAllies(state: MessageProtocol.GameState): MessageProtocol.Position[] {
+    const seen = new Set<number>();
+    const result: MessageProtocol.Position[] = [];
+
+    for (const player of [...state.TeamPlayers, ...state.VisiblePlayers]) {
+      if (player.IsSelf || seen.has(player.PlayerId)) {
+        continue;
+      }
+      if (!player.IsAlly && player.TeamId !== state.Team?.Id) {
+        continue;
+      }
+      seen.add(player.PlayerId);
+      result.push(player.Position);
+    }
+
+    return result;
+  }
+
+  private dominantDirection(
+    from: MessageProtocol.Position,
+    to: MessageProtocol.Position,
+  ): Direction {
+    const dx = to.X - from.X;
+    const dy = to.Y - from.Y;
+
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      return dx >= 0 ? "right" : "left";
+    }
+    return dy >= 0 ? "down" : "up";
   }
 
   /** Close in on the node, then mine it until full or exhausted. */
