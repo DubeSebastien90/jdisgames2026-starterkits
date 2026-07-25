@@ -3,6 +3,7 @@ import { GathererBehaviour } from "../behaviours/gatherer_behaviour";
 import { CompanionFarmerBehaviour } from "../behaviours/companion_farmer_behaviour";
 import { ExtractorPlacerBehaviour } from "../behaviours/extractor_placer_behaviour";
 import { PumpPlacerBehaviour } from "../behaviours/pump_placer_behaviour";
+import { ReturnToBaseBehaviour } from "../behaviours/return_to_base_behaviour";
 // import { ScoutBehaviour } from "../behaviours/scout_behaviour";
 
 type BehaviourFactory = () => IBehaviour;

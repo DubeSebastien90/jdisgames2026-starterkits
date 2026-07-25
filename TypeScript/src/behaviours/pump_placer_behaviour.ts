@@ -59,6 +59,14 @@ export class PumpPlacerBehaviour implements IBehaviour {
     state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
   ): MessageProtocol.ActionBase | null {
+    // DEBUG: log all visible resource names so we can see what the server sends.
+    if (state.VisibleResources.length > 0 && state.CurrentTick % 20 === 0) {
+      const names = state.VisibleResources.map(
+        (r) => `"${r.Name}" pump=${r.CanHostPump} handled=${this.handled.has(r.Id)}`,
+      );
+      console.log(`[${this.tag}] Visible resources: ${names.join(" | ")}`);
+    }
+
     const node = this.findBestNode(state, pos);
     if (!node) {
       return this.explore(pos);
@@ -175,9 +183,6 @@ export class PumpPlacerBehaviour implements IBehaviour {
         continue;
       }
       if (!resource.CanHostPump) {
-        continue;
-      }
-      if (!LIQUID_NAMES.includes(resource.Name.toLowerCase())) {
         continue;
       }
 
