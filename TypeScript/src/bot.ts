@@ -10,13 +10,25 @@ export class Bot implements IBot {
 
   // Head home once we carry this many items (or the inventory slots fill up).
   private static readonly CARRY_TARGET = 10;
-  // Gathering from an adjacent tile that yields nothing for this many ticks
-  // means the server wants us standing on the node instead.
-  private static readonly STUCK_TICKS = 5;
+  // Ticks of no yield AND no drop in the node's amount before we write a node
+  // off. Generous on purpose: mining may take several ticks per item.
+  private static readonly STUCK_TICKS = 25;
   // Deposit attempts on one tile before assuming it is the wrong spot.
   private static readonly DEPOSIT_TRIES = 3;
   // How far from the ship still counts as "at the ship" when we get wedged.
   private static readonly NEAR_BASE_RANGE = 2;
+  // Pathfinding: how far from the bot to search, and a hard cap on the work.
+  private static readonly PATH_RADIUS = 25;
+  private static readonly PATH_MAX_NODES = 4000;
+  // A tile that refused us is avoided for this long. Expires because the
+  // blocker is often another bot, which will have moved on by then.
+  private static readonly BLOCK_TTL = 30;
+  // How far ahead to aim when wandering left looking for resources.
+  private static readonly SEEK_AHEAD = 12;
+  // Ticks between "everything is mined out" reports, so waiting is not spammy.
+  private static readonly EMPTY_LOG_EVERY = 20;
+  // How long a node that refused to yield is skipped over.
+  private static readonly NODE_IGNORE_TTL = 60;
   // DEBUG: every bot ignores the seek/gather/return logic below and just sends
   // DepositToBase every tick, wherever it stands. Set back to false for play.
   private static readonly FORCE_DEPOSIT = false;
@@ -34,7 +46,7 @@ export class Bot implements IBot {
   private targetPosition: MessageProtocol.Position | null = null;
   private lastCarried = 0;
   private idleTicks = 0;
-  private standOnNode = false;
+  private lastNodeAmount: number | null = null;
   private depositSpots: MessageProtocol.Position[] | null = null;
   private probeIndex = 0;
   private depositTicks = 0;
@@ -49,6 +61,9 @@ export class Bot implements IBot {
   private moveRefused = false;
   private refusedFrom: MessageProtocol.Position | null = null;
   private refusedTo: MessageProtocol.Position | null = null;
+  private readonly blockedUntil = new Map<string, number>();
+  private lastEmptyLogTick = -Bot.EMPTY_LOG_EVERY;
+  private readonly ignoredNodes = new Map<number, number>();
 
   public getNextAction(
     state: MessageProtocol.GameState,
@@ -65,7 +80,7 @@ export class Bot implements IBot {
     }
 
     // Did last tick's move actually happen?
-    this.updateMoveOutcome(pos);
+    this.updateMoveOutcome(pos, state.CurrentTick);
 
     if (Bot.USE_DETOUR) {
       this.checkIfStuck();
@@ -138,7 +153,7 @@ export class Bot implements IBot {
    * tick regardless of USE_DETOUR, because the deposit logic needs to know
    * when we are wedged too.
    */
-  private updateMoveOutcome(pos: MessageProtocol.Position): void {
+  private updateMoveOutcome(pos: MessageProtocol.Position, tick: number): void {
     const from = this.posBeforeMove;
     const to = this.lastMoveTarget;
     this.posBeforeMove = null;
@@ -155,6 +170,9 @@ export class Bot implements IBot {
       this.moveRefused = true;
       this.refusedFrom = from;
       this.refusedTo = to;
+      // Remember it so the next path plans around it, but only for a while:
+      // the blocker may well be another bot that is about to walk away.
+      this.blockedUntil.set(`${to.X},${to.Y}`, tick + Bot.BLOCK_TTL);
       return;
     }
 
@@ -204,14 +222,30 @@ export class Bot implements IBot {
     return new MessageProtocol.DepositToBaseAction();
   }
 
-  /** Walk left until a resource shows up in vision. */
+  /**
+   * Head for the nearest node that still has something in it. Nodes run out
+   * and respawn on a timer, so when everything in sight is empty we wait next
+   * to the closest one rather than wandering out of the area.
+   */
   private seek(
     state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
   ): MessageProtocol.ActionBase | null {
-    const node = this.nearestResource(pos, state.VisibleResources);
+    const node = this.nearestResource(pos, state.VisibleResources, true, state.CurrentTick);
     if (!node) {
-      return this.move(pos, new MessageProtocol.Position(pos.X - 1, pos.Y));
+      const empty = this.nearestResource(pos, state.VisibleResources, false, state.CurrentTick);
+      if (empty) {
+        this.logEmptyNodes(state, pos, empty);
+        return this.chebyshev(pos, empty.Position) <= 1
+          ? null
+          : this.stepToward(state, pos, empty.Position);
+      }
+
+      return this.stepToward(
+        state,
+        pos,
+        new MessageProtocol.Position(pos.X - Bot.SEEK_AHEAD, pos.Y),
+      );
     }
 
     this.targetId = node.Id;
@@ -240,21 +274,13 @@ export class Bot implements IBot {
       return this.startReturn(state, pos, carried);
     }
 
-    const range = this.standOnNode ? 0 : 1;
+    // Node tiles are never walkable, so "close enough" means adjacent. Never
+    // try to stand on the node itself: the move is refused and we would spend
+    // every tick bumping into it instead of ever calling Gather.
     const distance = this.chebyshev(pos, target);
-    if (distance > range) {
-      return this.stepToward(pos, target);
+    if (distance > 1) {
+      return this.stepToward(state, pos, target);
     }
-
-    // In range. If mining yields nothing for a while, try standing on the node.
-    if (carried > this.lastCarried) {
-      this.idleTicks = 0;
-    } else if (++this.idleTicks > Bot.STUCK_TICKS && !this.standOnNode) {
-      console.log("[BOT] No yield from an adjacent tile, stepping onto the node.");
-      this.standOnNode = true;
-      this.idleTicks = 0;
-    }
-    this.lastCarried = carried;
 
     // Node gone or drained: take whatever we have home, or look for another.
     const node = state.VisibleResources.find((r) => r.Id === this.targetId);
@@ -262,12 +288,38 @@ export class Bot implements IBot {
       console.log("[BOT] Node depleted.");
       this.targetId = null;
       this.targetPosition = null;
+      this.lastNodeAmount = null;
       if (carried > 0) {
         return this.startReturn(state, pos, carried);
       }
       this.phase = "seek";
       return this.seek(state, pos);
     }
+
+    // Mining may take several ticks per item, so a draining node counts as
+    // progress even before anything lands in our inventory.
+    const progressed =
+      carried > this.lastCarried ||
+      (this.lastNodeAmount !== null && node.CurrentAmount < this.lastNodeAmount);
+
+    if (progressed) {
+      this.idleTicks = 0;
+    } else if (++this.idleTicks > Bot.STUCK_TICKS) {
+      console.log(
+        `[BOT] Node ${this.targetId} gave nothing in ${Bot.STUCK_TICKS} ticks, ` +
+          "ignoring it and looking elsewhere.",
+      );
+      this.ignoredNodes.set(node.Id, state.CurrentTick + Bot.NODE_IGNORE_TTL);
+      this.targetId = null;
+      this.targetPosition = null;
+      this.lastNodeAmount = null;
+      this.idleTicks = 0;
+      this.phase = "seek";
+      return this.seek(state, pos);
+    }
+
+    this.lastCarried = carried;
+    this.lastNodeAmount = node.CurrentAmount;
 
     return new MessageProtocol.GatherNodeAction(target);
   }
@@ -314,7 +366,7 @@ export class Bot implements IBot {
         this.depositSpots[this.probeIndex] = spot;
         this.depositTicks = 0;
       } else {
-        return this.stepToward(pos, spot);
+        return this.stepToward(state, pos, spot);
       }
     }
 
@@ -456,7 +508,7 @@ export class Bot implements IBot {
     this.phase = "return";
     this.targetId = null;
     this.targetPosition = null;
-    this.standOnNode = false;
+    this.lastNodeAmount = null;
     this.idleTicks = 0;
     this.depositLocked = false;
     this.lastDepositCarried = null;
@@ -487,11 +539,21 @@ export class Bot implements IBot {
     return insideRect || (pos.X === base.Position.X && pos.Y === base.Position.Y);
   }
 
-  /** One tile per tick, closing X first then Y. */
+  /**
+   * One tile per tick. Routes around trees, hulls and other bots using the
+   * tiles we can currently see, falling back to a straight X-then-Y step when
+   * no route is found (target out of vision, or we are boxed in).
+   */
   private stepToward(
+    state: MessageProtocol.GameState,
     from: MessageProtocol.Position,
     to: MessageProtocol.Position,
   ): MessageProtocol.MoveAction {
+    const planned = this.findFirstStep(state, from, to);
+    if (planned) {
+      return this.move(from, planned);
+    }
+
     const deltaX = to.X - from.X;
     const deltaY = to.Y - from.Y;
 
@@ -503,15 +565,134 @@ export class Bot implements IBot {
     );
   }
 
+  /**
+   * Breadth-first search over visible tiles, re-run every tick so moving
+   * obstacles (other bots) are handled naturally. Returns the first step of
+   * the route, or of the best partial route when the goal is unreachable.
+   */
+  private findFirstStep(
+    state: MessageProtocol.GameState,
+    from: MessageProtocol.Position,
+    to: MessageProtocol.Position,
+  ): MessageProtocol.Position | null {
+    const startKey = `${from.X},${from.Y}`;
+    const goalKey = `${to.X},${to.Y}`;
+    if (startKey === goalKey) {
+      return null;
+    }
+
+    const positions = new Map<string, MessageProtocol.Position>([[startKey, from]]);
+    const cameFrom = new Map<string, string>();
+    const visited = new Set<string>([startKey]);
+    const queue: MessageProtocol.Position[] = [from];
+
+    let head = 0;
+    let bestKey = startKey;
+    let bestDistance = this.manhattan(from, to);
+
+    while (head < queue.length && head < Bot.PATH_MAX_NODES) {
+      const current = queue[head++];
+      const currentKey = `${current.X},${current.Y}`;
+
+      const distance = this.manhattan(current, to);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestKey = currentKey;
+      }
+
+      if (currentKey === goalKey) {
+        bestKey = currentKey;
+        break;
+      }
+
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const next = new MessageProtocol.Position(current.X + dx, current.Y + dy);
+        const nextKey = `${next.X},${next.Y}`;
+
+        if (visited.has(nextKey)) {
+          continue;
+        }
+        if (
+          Math.abs(next.X - from.X) > Bot.PATH_RADIUS ||
+          Math.abs(next.Y - from.Y) > Bot.PATH_RADIUS
+        ) {
+          continue;
+        }
+        if (nextKey !== goalKey && !this.isWalkable(state, next)) {
+          continue;
+        }
+
+        visited.add(nextKey);
+        positions.set(nextKey, next);
+        cameFrom.set(nextKey, currentKey);
+        queue.push(next);
+      }
+    }
+
+    if (bestKey === startKey) {
+      return null;
+    }
+
+    // Walk the parent chain back until the tile whose parent is where we stand.
+    let key = bestKey;
+    while (cameFrom.get(key) !== startKey) {
+      const parent = cameFrom.get(key);
+      if (!parent) {
+        return null;
+      }
+      key = parent;
+    }
+
+    return positions.get(key) ?? null;
+  }
+
+  /**
+   * Trees are resource nodes, so HasResource blocks. Unknown tiles are treated
+   * as open, otherwise the bot could never path outside its own vision.
+   */
+  private isWalkable(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): boolean {
+    const blockedUntil = this.blockedUntil.get(`${pos.X},${pos.Y}`);
+    if (blockedUntil !== undefined && blockedUntil > state.CurrentTick) {
+      return false;
+    }
+
+    const tile = state.getTileAt(pos);
+    if (!tile) {
+      return true;
+    }
+
+    const category = tile.TerrainCategory.toLowerCase();
+    if (category.includes("liquid") || category.includes("water")) {
+      return false;
+    }
+
+    return !tile.HasResource && !tile.HasStructure && !tile.HasEntity;
+  }
+
+  private manhattan(a: MessageProtocol.Position, b: MessageProtocol.Position): number {
+    return Math.abs(a.X - b.X) + Math.abs(a.Y - b.Y);
+  }
+
+  /** @param mustHaveStock skip nodes that are currently mined out. */
   private nearestResource(
     from: MessageProtocol.Position,
     resources: MessageProtocol.Resource[],
+    mustHaveStock: boolean,
+    tick: number,
   ): MessageProtocol.Resource | null {
     let best: MessageProtocol.Resource | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
 
     for (const resource of resources) {
-      if (resource.CurrentAmount <= 0) {
+      if (mustHaveStock && resource.CurrentAmount <= 0) {
+        continue;
+      }
+
+      const ignoredUntil = this.ignoredNodes.get(resource.Id);
+      if (ignoredUntil !== undefined && ignoredUntil > tick) {
         continue;
       }
 
@@ -524,6 +705,32 @@ export class Bot implements IBot {
     }
 
     return best;
+  }
+
+  /**
+   * Throttled report of why nothing is being mined. Also prints the raw
+   * amounts: if every node shows 0/0 the field is not being parsed rather
+   * than the nodes genuinely being empty.
+   */
+  private logEmptyNodes(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+    waitingOn: MessageProtocol.Resource,
+  ): void {
+    if (state.CurrentTick - this.lastEmptyLogTick < Bot.EMPTY_LOG_EVERY) {
+      return;
+    }
+    this.lastEmptyLogTick = state.CurrentTick;
+
+    const summary = state.VisibleResources.slice(0, 6)
+      .map((r) => `${r.Name} ${r.CurrentAmount}/${r.Capacity} respawn=${r.RemainingTicks}`)
+      .join(" | ");
+
+    console.log(
+      `[BOT] ${state.VisibleResources.length} node(s) visible, none with stock. ` +
+        `Waiting at ${pos.X},${pos.Y} for ${waitingOn.Name} at ` +
+        `${waitingOn.Position.X},${waitingOn.Position.Y}. [${summary}]`,
+    );
   }
 
   private carriedCount(inventory: MessageProtocol.ItemStack[]): number {
