@@ -110,3 +110,7 @@ $RECYCLE.BIN/
 backend/GameServer/ConfigFiles/admin.token
 backend/GameServer/ConfigFiles/saves_archive/*
 backend/GameServer/ConfigFiles/default-competition/*
+
+# Bot map memory: local scouting cache, per-machine and per-match.
+.world-memory.json
+.world-memory.json.tmp

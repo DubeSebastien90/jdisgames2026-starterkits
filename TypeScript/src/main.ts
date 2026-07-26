@@ -1,5 +1,9 @@
 import { Bot } from "./bot";
 import { BotRunner } from "./bot_logic/bot_runner";
+import { quietProtocolLogs } from "./log_filter";
+
+// Hide the client's per-action JSON dump. VERBOSE_PROTOCOL=1 brings it back.
+quietProtocolLogs();
 
 const URL_REMOTE = "https://jg26.jdis.ca";
 

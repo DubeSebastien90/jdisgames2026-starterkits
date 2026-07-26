@@ -11,6 +11,7 @@ import {
 } from "../team/team_scouting";
 import { BaseGeometry } from "../world/base_geometry";
 import { ResourceKind, matchesResourceKind } from "../world/resource_kinds";
+import { WorldMemory } from "../world/world_memory";
 
 type Phase = "seek" | "gather" | "return";
 
@@ -74,6 +75,17 @@ export class GathererBehaviour implements IBehaviour {
   private static readonly FORCE_DEPOSIT = false;
   // Set false to go back to walking every load home yourself.
   private static readonly SHIP_BY_COMPANION = true;
+  // Ticks of *no new items* before shipping a part-load rather than sitting on
+  // it. This is a stall timer, not a deadline: every item mined resets it, so a
+  // bot on a yielding node keeps filling until the companion leaves full, and
+  // only a dry node makes it ship short.
+  private static readonly FILL_WAIT_TICKS = 30;
+  // Ticks between "here is why nothing shipped" reports.
+  private static readonly SKIP_LOG_EVERY = 20;
+  // Ticks to keep watching for the drop in what we carry after a send before
+  // deciding the companion took nothing. Inventory updates arrive on their own
+  // message, so the drop can land a tick or two after the send.
+  private static readonly MEASURE_WINDOW = 3;
   // Skip nodes whose regen timer is still running: whatever is in them now is
   // the tail end of a refill, so it is not worth the walk while other nodes
   // sit at full stock. Set false to mine anything with a single item in it.
@@ -106,6 +118,8 @@ export class GathererBehaviour implements IBehaviour {
    * a destroyed machine puts the node back in play.
    */
   private readonly machineNodes = new Set<number>();
+  /** Whether the map on disk has been folded into knownNodes yet. */
+  private seeded = false;
   private exploreDirection: Direction | null = null;
   private exploreTicksLeft = 0;
   private exploreCount = 0;
@@ -117,10 +131,23 @@ export class GathererBehaviour implements IBehaviour {
    * needs to know they exist.
    */
   private companionCapacity = 1;
-  /** Carried count on the tick we sent, so the next tick can measure the drop. */
+  /** Carried count on the tick we sent, so a later tick can measure the drop. */
   private sentAtCarried: number | null = null;
+  /** When that send went out, so the measurement can wait for slow inventory. */
+  private sentAtTick: number | null = null;
   private sends = 0;
   private refusedSends = 0;
+  /**
+   * Ticks spent holding out for the probe load. Capacity is only ever learned by
+   * sending, so a bot that never reaches capacity + 1 — a dry node, a slow
+   * yield, one item left — would hold that load for the rest of the game
+   * waiting to probe with it. The wait is bounded so it ships anyway.
+   */
+  private fillStallTicks = 0;
+  /** What we were carrying last tick, to tell "still filling" from "stalled". */
+  private lastFillCarried = 0;
+  /** Last tick we said why a send was skipped, so the reason is not spammy. */
+  private lastSkipLogTick = -GathererBehaviour.SKIP_LOG_EVERY;
   /** Every node we have ever seen, so respawns out of vision are not lost. */
   private readonly knownNodes = new Map<
     number,
@@ -144,6 +171,7 @@ export class GathererBehaviour implements IBehaviour {
 
     // Both bots log to the same console, so stamp every line with which one.
     this.tag = state.Bot.BotType || "bot";
+    this.seedFromWorldMemory(state);
     this.rememberVisibleNodes(state);
 
     const pos = state.Bot.Position;
@@ -157,7 +185,7 @@ export class GathererBehaviour implements IBehaviour {
     this.mover.observe(state, pos);
 
     // How much a companion took tells us its capacity, so measure it first.
-    this.measureCapacity(carried);
+    this.measureCapacity(carried, state.CurrentTick);
 
     // Shipping is tried in every phase: on the node, on the way to one, and
     // even while walking home, since anything a companion takes is one less
@@ -209,35 +237,73 @@ export class GathererBehaviour implements IBehaviour {
     }
 
     if (!this.shippingBeatsWalking(state, pos)) {
+      // Only ever false with a known base, since an unknown one ships by default.
+      const distance = state.Base ? this.manhattan(pos, state.Base.Position) : 0;
+      this.logSkip(
+        state,
+        `base is only ${distance} away, so walking ${GathererBehaviour.CARRY_TARGET} home ` +
+          `beats ${GathererBehaviour.CARRY_TARGET / this.companionCapacity} sends`,
+      );
       return null;
     }
 
-    // Hold one more item than we think fits, so every send finds out whether
-    // the capacity has been researched up. Costs nothing while we are mining
-    // anyway, and converges on the real number within a few sends. Skipped once
-    // the pack is full, or when we are already walking home with a load.
+    // Send companions full. A companion takes as much as it can hold and no
+    // more, so dispatching one while we carry 2 of the 5 it could take throws
+    // away three items, a slot, and the round trip — and slots are the scarce
+    // thing, not items.
     //
-    // Never probe past a load we would carry home, or the walk-home check below
-    // fires first and we set off on a trip we did not need.
-    const probeLoad = Math.min(
+    // The load we hold out for is one *more* than we think fits, so every send
+    // doubles as a probe for a capacity the research tree has raised (see
+    // measureCapacity). Never past a load we would carry home ourselves, or the
+    // walk-home check fires first and we set off on a trip we did not need.
+    const fullLoad = Math.min(
       this.companionCapacity + 1,
       GathererBehaviour.CARRY_TARGET,
     );
-    if (
-      carried < probeLoad &&
-      !this.slotsFull(state.Bot) &&
-      this.phase !== "return"
-    ) {
-      return null;
+    // A full pack or a walk home means no more items are coming, so whatever is
+    // in hand is as full as this companion is ever going to be.
+    const stillFilling = !this.slotsFull(state.Bot) && this.phase !== "return";
+
+    // Every item mined resets the clock: while the load grows, keep filling.
+    // A drop counts too — a deposit or a send means the next load starts fresh,
+    // and it must not inherit a stall clock from the last one.
+    if (carried !== this.lastFillCarried) {
+      this.fillStallTicks = 0;
+    }
+    this.lastFillCarried = carried;
+
+    if (carried < fullLoad && stillFilling) {
+      if (++this.fillStallTicks <= GathererBehaviour.FILL_WAIT_TICKS) {
+        this.logSkip(
+          state,
+          `holding ${carried} until a companion can leave with ${fullLoad}, ` +
+            `${GathererBehaviour.FILL_WAIT_TICKS - this.fillStallTicks + 1} ticks before shipping anyway`,
+        );
+        return null;
+      }
+
+      // Nothing arriving. A part-load in the base beats a full one in our pack.
+      this.logSkip(
+        state,
+        `no new items for ${GathererBehaviour.FILL_WAIT_TICKS} ticks, shipping ${carried} of ${fullLoad}`,
+      );
     }
 
     // Every slot busy. Nothing to do but keep mining, and if the pack is full
     // the caller falls through to walking it home instead of idling here.
     if (state.Team.CompanionNumber >= state.Team.CompanionSlots) {
+      this.logSkip(
+        state,
+        `every companion slot is busy (${state.Team.CompanionNumber}/${state.Team.CompanionSlots}). ` +
+          `A slot count of 0 means companions are not researched yet`,
+      );
       return null;
     }
 
     this.sentAtCarried = carried;
+    this.sentAtTick = state.CurrentTick;
+    this.fillStallTicks = 0;
+    this.lastFillCarried = 0;
     this.sends++;
     console.log(
       `[${this.tag}] Companion ${this.sends} away with up to ${this.companionCapacity} of ${carried} ` +
@@ -245,6 +311,24 @@ export class GathererBehaviour implements IBehaviour {
     );
 
     return new MessageProtocol.SendCompanionAction();
+  }
+
+  /**
+   * Say why nothing shipped this tick. Every check above returns null quietly on
+   * its own, which makes a bot that never sends a companion impossible to read
+   * from the console. Throttled, because most of these are true for a long run
+   * of ticks rather than one.
+   */
+  private logSkip(state: MessageProtocol.GameState, reason: string): void {
+    if (
+      state.CurrentTick - this.lastSkipLogTick <
+      GathererBehaviour.SKIP_LOG_EVERY
+    ) {
+      return;
+    }
+
+    this.lastSkipLogTick = state.CurrentTick;
+    console.log(`[${this.tag}] No companion sent: ${reason}.`);
   }
 
   /**
@@ -274,25 +358,43 @@ export class GathererBehaviour implements IBehaviour {
   /**
    * A companion takes as much as it can hold, so the drop in what we carry is
    * its capacity — provided we were holding at least that much.
+   *
+   * The drop does not have to show up on the very next tick. Inventory arrives
+   * on its own ReceivePlayerInfo message, independent of the Tick that makes us
+   * act (see GameClient), so a send can look like it took nothing simply because
+   * the new inventory has not landed yet. Hence the window: we keep looking for
+   * the drop for a few ticks before calling a send refused.
    */
-  private measureCapacity(carried: number): void {
+  private measureCapacity(carried: number, tick: number): void {
     if (this.sentAtCarried === null) {
       return;
     }
 
     const shipped = this.sentAtCarried - carried;
-    this.sentAtCarried = null;
 
-    if (shipped > this.companionCapacity) {
-      console.log(
-        `[${this.tag}] A companion carried ${shipped} items, so capacity is now ${shipped}.`,
-      );
-      this.companionCapacity = shipped;
+    if (shipped > 0) {
+      this.sentAtCarried = null;
       this.refusedSends = 0;
+
+      if (shipped > this.companionCapacity) {
+        console.log(
+          `[${this.tag}] A companion carried ${shipped} items, so capacity is now ${shipped}.`,
+        );
+        this.companionCapacity = shipped;
+      }
       return;
     }
 
-    if (shipped <= 0 && ++this.refusedSends === 3) {
+    // Nothing has moved yet. Give the inventory a few ticks to catch up.
+    if (
+      this.sentAtTick !== null &&
+      tick - this.sentAtTick < GathererBehaviour.MEASURE_WINDOW
+    ) {
+      return;
+    }
+
+    this.sentAtCarried = null;
+    if (++this.refusedSends === 3) {
       console.log(
         `[${this.tag}] 3 companions took nothing. Check the [SERVER] Error lines: ` +
           `the send is being refused, not the capacity being small.`,
@@ -376,6 +478,51 @@ export class GathererBehaviour implements IBehaviour {
     console.log(`[${this.tag}] Targeting ${node.Name} at ${node.Position.X},${node.Position.Y}`);
 
     return this.gather(state, pos, this.carriedCount(state.Bot?.Inventory ?? []));
+  }
+
+  /**
+   * Fill knownNodes from the map on disk, once, on the first tick.
+   *
+   * Everything downstream already works off knownNodes — bestRememberedNode walks
+   * back to nodes out of sight and ages their respawn timers forward — so seeding
+   * it is all this takes: a restarted bot starts with every node the team has ever
+   * found instead of an empty map. Only nodes we would actually mine are taken,
+   * judged the same way as a visible one.
+   *
+   * Anything seen this run wins, since rememberVisibleNodes runs straight after.
+   */
+  private seedFromWorldMemory(state: MessageProtocol.GameState): void {
+    if (this.seeded) {
+      return;
+    }
+    this.seeded = true;
+
+    let taken = 0;
+    for (const node of WorldMemory.knownResources(state.Bot?.Position ?? new MessageProtocol.Position(0, 0))) {
+      if (this.knownNodes.has(node.id)) {
+        continue;
+      }
+
+      // matchesResourceKind wants a Resource; the name and loot item are all it
+      // reads, and both are on the record.
+      const probe = new MessageProtocol.Resource();
+      probe.Name = node.name;
+      probe.LootItem = node.lootItem;
+
+      this.knownNodes.set(node.id, {
+        name: node.name,
+        position: node.position,
+        amount: node.lastAmount,
+        respawnTicks: node.lastRemainingTicks,
+        seenTick: node.lastSeenTick,
+        wanted: this.wanted(probe),
+      });
+      taken++;
+    }
+
+    if (taken > 0) {
+      console.log(`[${this.tag}] Starting with ${taken} node(s) remembered from the map on disk.`);
+    }
   }
 
   /** Record everything in sight, so we can come back after a respawn. */

@@ -1,5 +1,6 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
+import { WorldMemory } from "../world/world_memory";
 
 type Phase = "seek" | "walk" | "place" | "explore";
 
@@ -18,6 +19,8 @@ export class PumpPlacerBehaviour implements IBehaviour {
   private targetId: number | null = null;
   private targetPosition: MessageProtocol.Position | null = null;
   private readonly handled = new Set<number>();
+  /** Which remembered site we last announced, so the log says it once. */
+  private announcedSite: number | null = null;
   private posBeforeMove: MessageProtocol.Position | null = null;
   private lastMoveTarget: MessageProtocol.Position | null = null;
   private stuckTicks = 0;
@@ -69,6 +72,25 @@ export class PumpPlacerBehaviour implements IBehaviour {
 
     const node = this.findBestNode(state, pos);
     if (!node) {
+      // Nothing usable in sight, but the map on disk may know where a pumpable
+      // node is. Walking to one beats picking a direction at random.
+      const site = WorldMemory.nextHostSite(pos, "pump", {
+        visible: new Set(state.VisibleResources.map((resource) => resource.Id)),
+        skip: this.handled,
+      });
+
+      if (site && this.stuckTicks <= PumpPlacerBehaviour.STUCK_LIMIT) {
+        if (this.announcedSite !== site.id) {
+          this.announcedSite = site.id;
+          console.log(
+            `[${this.tag}] Nothing in sight; heading for the remembered ${site.name} at ` +
+              `${site.position.X},${site.position.Y}.`,
+          );
+        }
+        this.phase = "explore";
+        return this.stepToward(pos, site.position);
+      }
+
       return this.explore(pos);
     }
 

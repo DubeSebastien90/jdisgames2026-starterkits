@@ -2,6 +2,7 @@ import * as MessageProtocol from "./client/message_protocol";
 import { IBot } from "./bot_logic/ibot";
 import { IBehaviour } from "./behaviours/ibehaviour";
 import { TeamController } from "./team/team_controller";
+import { WorldMemory } from "./world/world_memory";
 
 /**
  * Thin shell the runner instantiates. All the actual thinking lives in a
@@ -20,6 +21,12 @@ export class Bot implements IBot {
     if (!state.Bot) {
       return null;
     }
+
+    // Map what we can see before deciding anything, so the knowledge is kept
+    // whatever this bot is doing: a gatherer maps enemy machines for a later
+    // raider, and a raider maps nodes for a later gatherer. Persisted, so a
+    // restarted dev server does not start blind. See WorldMemory.
+    WorldMemory.observe(state);
 
     // The runner creates every Bot the same way and never tells it which token
     // it connected with, so we wait for the server to say which bot we are.

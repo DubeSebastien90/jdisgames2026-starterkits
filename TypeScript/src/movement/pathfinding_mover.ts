@@ -1,6 +1,7 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IMover } from "./imover";
 import { TileClaims } from "./tile_claims";
+import { WorldMemory } from "../world/world_memory";
 
 /**
  * Breadth-first search over the tiles we can currently see, re-planned every
@@ -29,12 +30,15 @@ export class PathfindingMover implements IMover {
 
   private readonly blockedUntil = new Map<string, number>();
   /**
-   * Liquid tiles we have ever seen. Vision is cleared and rebuilt every update,
-   * so without this a lake is forgotten the moment we walk past it and the next
-   * route plans straight back through it — the bot then rediscovers the shore
-   * one refused move at a time. Terrain never changes, so this never goes stale.
+   * Liquid tiles are remembered in WorldMemory rather than here. Vision is cleared
+   * and rebuilt every update, so without a memory a lake is forgotten the moment
+   * we walk past it and the next route plans straight back through it — the bot
+   * then rediscovers the shore one refused move at a time. Terrain never changes,
+   * so the memory never goes stale.
+   *
+   * Kept out of this class on purpose: both bots share one map of the water, and
+   * it is written to disk, so a restart does not re-learn every shoreline.
    */
-  private readonly knownLiquid = new Set<string>();
   private posBeforeMove: MessageProtocol.Position | null = null;
   private lastMoveTarget: MessageProtocol.Position | null = null;
   private refused = false;
@@ -113,11 +117,9 @@ export class PathfindingMover implements IMover {
   /** Note every liquid tile in sight, so it stays off the map for good. */
   private rememberLiquid(state: MessageProtocol.GameState): void {
     for (const [key, tile] of state.VisibleTiles) {
-      if (!PathfindingMover.isPassable(tile)) {
-        const category = tile.TerrainCategory.toLowerCase();
-        if (category.includes("liquid") || category.includes("water")) {
-          this.knownLiquid.add(key);
-        }
+      const category = tile.TerrainCategory.toLowerCase();
+      if (category.includes("liquid") || category.includes("water")) {
+        WorldMemory.rememberLiquid(key);
       }
     }
   }
@@ -196,7 +198,7 @@ export class PathfindingMover implements IMover {
     state: MessageProtocol.GameState,
     pos: MessageProtocol.Position,
   ): boolean {
-    if (this.knownLiquid.has(`${pos.X},${pos.Y}`)) {
+    if (WorldMemory.isKnownLiquid(`${pos.X},${pos.Y}`)) {
       return true;
     }
 
@@ -332,7 +334,7 @@ export class PathfindingMover implements IMover {
     const key = `${pos.X},${pos.Y}`;
 
     // Remembered from an earlier sighting, even though we cannot see it now.
-    if (this.knownLiquid.has(key)) {
+    if (WorldMemory.isKnownLiquid(key)) {
       return false;
     }
 

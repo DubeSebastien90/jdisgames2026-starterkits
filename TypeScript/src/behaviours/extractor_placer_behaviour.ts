@@ -1,5 +1,6 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
+import { WorldMemory } from "../world/world_memory";
 
 type Phase = "seek" | "walk" | "place" | "done";
 
@@ -17,6 +18,8 @@ export class ExtractorPlacerBehaviour implements IBehaviour {
   private targetPosition: MessageProtocol.Position | null = null;
   /** Node IDs we already placed an extractor on (or that already had one). */
   private readonly handled = new Set<number>();
+  /** Which remembered site we last announced, so the log says it once. */
+  private announcedSite: number | null = null;
   private posBeforeMove: MessageProtocol.Position | null = null;
   private lastMoveTarget: MessageProtocol.Position | null = null;
   private stuckTicks = 0;
@@ -54,6 +57,26 @@ export class ExtractorPlacerBehaviour implements IBehaviour {
   ): MessageProtocol.ActionBase | null {
     const node = this.findBestNode(state, pos);
     if (!node) {
+      // Before giving up for good, ask the map on disk. This behaviour has no
+      // explore phase, so without this a bot that starts out of sight of a node
+      // stands still for the rest of the match.
+      const site = WorldMemory.nextHostSite(pos, "extractor", {
+        visible: new Set(state.VisibleResources.map((resource) => resource.Id)),
+        skip: this.handled,
+      });
+
+      if (site && this.stuckTicks <= ExtractorPlacerBehaviour.STUCK_LIMIT) {
+        if (this.announcedSite !== site.id) {
+          this.announcedSite = site.id;
+          console.log(
+            `[${this.tag}] No node in sight; heading for the remembered ${site.name} at ` +
+              `${site.position.X},${site.position.Y}.`,
+          );
+        }
+        this.phase = "seek";
+        return this.stepToward(pos, site.position);
+      }
+
       if (this.phase !== "done") {
         console.log(`[${this.tag}] No sugar cane node available for an extractor.`);
         this.phase = "done";

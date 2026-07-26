@@ -1,10 +1,14 @@
 import * as MessageProtocol from "../client/message_protocol";
 import { IBehaviour } from "./ibehaviour";
+import { IMover } from "../movement/imover";
+import { PathfindingMover } from "../movement/pathfinding_mover";
+import { ALL_DIRECTIONS, DIRECTION_VECTORS } from "../team/team_scouting";
 import {
   ResourceKind,
   matchesResourceKind,
   resourceKindLabel,
 } from "../world/resource_kinds";
+import { WorldMemory } from "../world/world_memory";
 
 type Phase = "seek" | "walk" | "place" | "wait" | "explore";
 
@@ -51,15 +55,22 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
   protected readonly kinds: readonly ResourceKind[];
   protected readonly includeLocked: boolean;
 
+  /**
+   * Shared navigation: routes around trees, lakes, hulls and other bots rather
+   * than walking into them. Every bot needs its own instance.
+   */
+  private readonly mover: IMover = new PathfindingMover();
+
   private tag = "bot";
   private phase: Phase = "seek";
   private targetId: number | null = null;
   private targetPosition: MessageProtocol.Position | null = null;
   /** Node ids we already placed on (or that already had one). */
   private readonly handled = new Set<number>();
+  /** Which remembered site we last announced, so the log says it once. */
+  private announcedSite: number | null = null;
   /** Locked nodes we ran out of patience for, and the tick they come back. */
   private readonly ignoredUntil = new Map<number, number>();
-  private posBeforeMove: MessageProtocol.Position | null = null;
   private stuckTicks = 0;
   private static readonly STUCK_LIMIT = 15;
 
@@ -117,7 +128,10 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
     const pos = state.Bot.Position;
 
     this.markExistingStructures(state);
-    this.detectStuck(pos);
+    // Let the mover see whether last tick's move actually happened, which is
+    // also how we know we are wedged.
+    this.mover.observe(state, pos);
+    this.detectStuck();
 
     if (this.phase === "seek" || this.phase === "explore") {
       return this.seek(state, pos);
@@ -137,7 +151,7 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
   ): MessageProtocol.ActionBase | null {
     const node = this.findBestNode(state, pos);
     if (!node) {
-      return this.explore(pos);
+      return this.explore(state, pos);
     }
 
     this.targetId = node.Id;
@@ -174,8 +188,13 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
       return this.seek(state, pos);
     }
 
-    // Adjacent is close enough to place.
-    if (this.chebyshev(pos, this.targetPosition) <= 1) {
+    // Adjacent is close enough to place — but adjacent means *orthogonally*
+    // adjacent, hence manhattan and not chebyshev. A tile touching the node
+    // corner to corner is chebyshev distance 1 and looks close enough, and every
+    // placement from there is refused: the bot then stands on the diagonal
+    // re-sending the same action until the stuck timer writes off a node that
+    // was reachable all along.
+    if (this.manhattan(pos, this.targetPosition) <= 1) {
       const node = this.visibleTarget(state);
       if (node && !this.canHost(node)) {
         // Still on cooldown: hold the spot rather than hand it to someone else.
@@ -186,7 +205,29 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
       return this.place(state, pos);
     }
 
-    return this.stepToward(pos, this.targetPosition);
+    // Walk to a tile beside the node, not to the node itself. Aiming at the node
+    // lets the route end on whichever tile it reaches first, diagonals included.
+    return this.mover.step(state, pos, this.approachTile(state, pos, this.targetPosition));
+  }
+
+  /**
+   * The closest tile beside the node that a bot could stand on. Falls back to
+   * the node itself when all four look taken — the pathfinder still closes the
+   * distance, and something will have moved by the time we arrive.
+   */
+  private approachTile(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+    node: MessageProtocol.Position,
+  ): MessageProtocol.Position {
+    const sides = ALL_DIRECTIONS.map((direction) => {
+      const vector = DIRECTION_VECTORS[direction];
+      return new MessageProtocol.Position(node.X + vector.x, node.Y + vector.y);
+    })
+      .filter((side) => PathfindingMover.isPassable(state.getTileAt(side)))
+      .sort((a, b) => this.manhattan(pos, a) - this.manhattan(pos, b));
+
+    return sides[0] ?? node;
   }
 
   /**
@@ -393,7 +434,71 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
     return ready ?? locked;
   }
 
-  private explore(pos: MessageProtocol.Position): MessageProtocol.MoveAction {
+  /**
+   * Nothing usable in sight. Walk to a node the map on disk says could host one of
+   * these before falling back on sweeping — a remembered site beats a heading, and
+   * after a restart the map usually has one.
+   */
+  private explore(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): MessageProtocol.ActionBase | null {
+    const remembered = this.rememberedSite(state, pos);
+    if (remembered) {
+      return remembered;
+    }
+
+    return this.sweep(state, pos);
+  }
+
+  private rememberedSite(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): MessageProtocol.ActionBase | null {
+    // Getting nowhere means the way there is blocked; sweep instead and leave the
+    // site on the map for a later attempt.
+    if (this.stuckTicks > StructureOnResourceBehaviour.STUCK_LIMIT) {
+      return null;
+    }
+
+    const machine = this.structureType === "Pump" ? "pump" : "extractor";
+    const site = WorldMemory.nextHostSite(pos, machine, {
+      visible: new Set(state.VisibleResources.map((resource) => resource.Id)),
+      skip: this.handled,
+    });
+
+    if (!site || !matchesResourceKind(this.asResource(site), this.kinds)) {
+      return null;
+    }
+
+    if (this.announcedSite !== site.id) {
+      this.announcedSite = site.id;
+      console.log(
+        `[${this.tag}] Nothing in sight; heading for the remembered ${site.name} at ` +
+          `${site.position.X},${site.position.Y}.`,
+      );
+    }
+
+    this.phase = "explore";
+    return this.mover.step(state, pos, site.position);
+  }
+
+  /** A remembered node as a Resource, for the kind filter. */
+  private asResource(site: {
+    name: string;
+    lootItem: string;
+  }): MessageProtocol.Resource {
+    const resource = new MessageProtocol.Resource();
+    resource.Name = site.name;
+    resource.LootItem = site.lootItem;
+    return resource;
+  }
+
+  /** Last resort: pick a direction and cover ground. */
+  private sweep(
+    state: MessageProtocol.GameState,
+    pos: MessageProtocol.Position,
+  ): MessageProtocol.ActionBase | null {
     const blocked = this.stuckTicks > StructureOnResourceBehaviour.STUCK_LIMIT;
 
     if (this.phase !== "explore" || this.exploreTicksLeft <= 0 || blocked) {
@@ -419,41 +524,35 @@ export abstract class StructureOnResourceBehaviour implements IBehaviour {
     }
 
     const dir = StructureOnResourceBehaviour.DIRECTIONS[this.exploreIndex];
-    return this.stepToward(
+    const move = this.mover.step(
+      state,
       pos,
       new MessageProtocol.Position(pos.X + dir.x * 10, pos.Y + dir.y * 10),
     );
+
+    if (!move) {
+      // Nothing open that way at all. Take the next heading next tick rather
+      // than re-planning the same dead end.
+      this.exploreTicksLeft = 0;
+    }
+
+    return move;
   }
 
-  private detectStuck(pos: MessageProtocol.Position): void {
-    const from = this.posBeforeMove;
-    if (from && pos.X === from.X && pos.Y === from.Y) {
+  /**
+   * The mover knows whether last tick's move was refused, which is a better
+   * signal than comparing positions ourselves: a tick spent deliberately
+   * waiting for a teammate to clear a tile is not being stuck.
+   */
+  private detectStuck(): void {
+    if (this.mover.lastMoveRefused) {
       this.stuckTicks++;
     } else {
       this.stuckTicks = 0;
     }
-    this.posBeforeMove = null;
-  }
-
-  private stepToward(
-    from: MessageProtocol.Position,
-    to: MessageProtocol.Position,
-  ): MessageProtocol.MoveAction {
-    this.posBeforeMove = from;
-    const dx = to.X - from.X;
-    const dy = to.Y - from.Y;
-    const next =
-      Math.abs(dx) >= Math.abs(dy)
-        ? new MessageProtocol.Position(from.X + Math.sign(dx), from.Y)
-        : new MessageProtocol.Position(from.X, from.Y + Math.sign(dy));
-    return new MessageProtocol.MoveAction(next);
   }
 
   private manhattan(a: MessageProtocol.Position, b: MessageProtocol.Position): number {
     return Math.abs(a.X - b.X) + Math.abs(a.Y - b.Y);
-  }
-
-  private chebyshev(a: MessageProtocol.Position, b: MessageProtocol.Position): number {
-    return Math.max(Math.abs(a.X - b.X), Math.abs(a.Y - b.Y));
   }
 }
